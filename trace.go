@@ -7,7 +7,7 @@ author david stainton
 package main
 
 import (
-	//	"code.google.com/p/gopacket"
+	"code.google.com/p/gopacket"
 	"code.google.com/p/gopacket/layers"
 	"fmt"
 	"github.com/david415/go-netfilter-queue"
@@ -17,6 +17,7 @@ type NFQueueTraceroute struct {
 	q       *netfilter.NFQueue
 	packets <-chan netfilter.NFPacket
 	count   int
+	ttl     uint8
 	done    chan bool
 }
 
@@ -46,28 +47,51 @@ func (n *NFQueueTraceroute) Stop() {
 	n.q.Close()
 }
 
+/* XXX todo: Make this "iterator" smarter;
+   perhaps increment after repeating a TTL 3 times or so.
+*/
+func (n *NFQueueTraceroute) currentTTL() uint8 {
+	n.ttl += 1
+	return n.ttl
+}
+
+/* XXX todo: we can fuck with some unknown ratio of packets
+for a given flow without brekaing it. Perhaps this can be dynamic based on
+packets per second in a given flow?
+*/
 func (n *NFQueueTraceroute) processPacket(p netfilter.NFPacket) {
-	netLayer := p.Packet.Layer(layers.LayerTypeIPv4)
-	if netLayer == nil {
-		netLayer = p.Packet.Layer(layers.LayerTypeIPv6)
-	}
-	if netLayer == nil {
-		panic("wtf")
-	}
-
-	tcpLayer := p.Packet.Layer(layers.LayerTypeTCP)
-
-	if tcpLayer == nil {
+	n.count += 1
+	if n.count%67 == 0 {
+		p.SetModifiedVerdict(netfilter.NF_ACCEPT, serializeWithTTL(p.Packet, n.currentTTL()))
+	} else {
 		p.SetVerdict(netfilter.NF_ACCEPT)
-		return
 	}
+}
 
-	ip, _ := netLayer.(*layers.IPv4) // XXX fix me
+// XXX fixme: make me work with IPv6!
+// This function takes a
+func serializeWithTTL(p gopacket.Packet, ttl uint8) []byte {
+	ipLayer := p.Layer(layers.LayerTypeIPv4)
+	if ipLayer == nil {
+		return nil
+	}
+	tcpLayer := p.Layer(layers.LayerTypeTCP)
+	if tcpLayer == nil {
+		return nil
+	}
+	ip, _ := ipLayer.(*layers.IPv4)
+	ip.TTL = ttl
 	tcp, _ := tcpLayer.(*layers.TCP)
-
-	ip.TTL = 1
-	fmt.Printf("tcp/ip packet ttl %d tcp.DstPort %d\n", ip.TTL, tcp.DstPort)
-	p.SetVerdict(netfilter.NF_ACCEPT)
+	opts := gopacket.SerializeOptions{
+		FixLengths:       true,
+		ComputeChecksums: true,
+	}
+	tcp.SetNetworkLayerForChecksum(ip)
+	rawPacketBuf := gopacket.NewSerializeBuffer()
+	if err := gopacket.SerializeLayers(rawPacketBuf, opts, ip, tcp); err != nil {
+		return nil
+	}
+	return rawPacketBuf.Bytes()
 }
 
 /***
@@ -78,7 +102,8 @@ iptables -A OUTPUT -j NFQUEUE --queue-num 0 -p tcp --dport 2666
 ***/
 func main() {
 	n := NFQueueTraceroute{
-		count: 1000,
+		count: 1,
+		ttl:   1,
 	}
 	n.Start()
 }
