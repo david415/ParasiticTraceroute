@@ -9,7 +9,10 @@ package main
 import (
 	"code.google.com/p/gopacket"
 	"code.google.com/p/gopacket/layers"
+	"code.google.com/p/gopacket/pcap"
 	"github.com/david415/go-netfilter-queue"
+	"log"
+	"net"
 )
 
 type NFQueueTraceroute struct {
@@ -32,6 +35,7 @@ func NewNFQueueTraceroute(ttlRepeatMax, mangleFreq int) NFQueueTraceroute {
 	nfqTrace.mangleFreq = mangleFreq
 	nfqTrace.ttlRepeatMax = ttlRepeatMax
 	nfqTrace.ttlRepeat = 1
+	nfqTrace.ttl = 1
 	nfqTrace.count = 1
 	return nfqTrace
 }
@@ -44,17 +48,21 @@ func (n *NFQueueTraceroute) Start() {
 	if err != nil {
 		panic(err)
 	}
+
 	n.done = make(chan bool)
 	n.packets = n.q.GetPackets()
-	for true {
-		select {
-		case p := <-n.packets:
-			n.processPacket(p)
-		case <-n.done:
-			close(n.done)
-			break
+
+	go func() {
+		for true {
+			select {
+			case p := <-n.packets:
+				n.processPacket(p)
+			case <-n.done:
+				close(n.done)
+				break
+			}
 		}
-	}
+	}()
 }
 
 func (n *NFQueueTraceroute) Stop() {
@@ -66,7 +74,7 @@ func (n *NFQueueTraceroute) Stop() {
 // each TTL is used n.ttlRepeatMax number of times.
 func (n *NFQueueTraceroute) nextTTL() uint8 {
 	n.ttlRepeat += 1
-	if n.ttlRepeat > n.ttlRepeatMax {
+	if n.ttlRepeat >= n.ttlRepeatMax {
 		n.ttl += 1
 		n.ttlRepeat = 0
 	}
@@ -112,6 +120,51 @@ func serializeWithTTL(p gopacket.Packet, ttl uint8) []byte {
 	return rawPacketBuf.Bytes()
 }
 
+// return a net.IP channel to report all the ICMP reponse SrcIP addresses
+// that have the ICMP time exceeded flag set
+func getICMPReponseChan(iface string) <-chan net.IP {
+	snaplen := 65536
+	filter := "icmp" // the idea here is to capture only ICMP packets
+
+	var eth layers.Ethernet
+	var ip4 layers.IPv4
+	var icmp layers.ICMPv4
+	var payload gopacket.Payload
+
+	ipChan := make(chan net.IP)
+	decoded := make([]gopacket.LayerType, 0, 4)
+
+	handle, err := pcap.OpenLive(iface, int32(snaplen), true, pcap.BlockForever)
+	if err != nil {
+		log.Fatal("error opening pcap handle: ", err)
+	}
+	if err := handle.SetBPFFilter(filter); err != nil {
+		log.Fatal("error setting BPF filter: ", err)
+	}
+
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip4, &icmp, &payload)
+
+	go func() {
+		for true {
+			data, _, err := handle.ReadPacketData()
+			if err != nil {
+				continue
+			}
+
+			err = parser.DecodeLayers(data, &decoded)
+			if err != nil {
+				continue
+			}
+
+			typ := uint8(icmp.TypeCode >> 8)
+			if typ == layers.ICMPv4TypeTimeExceeded {
+				ipChan <- ip4.SrcIP
+			}
+		}
+	}()
+	return ipChan
+}
+
 /***
 use this rough POC with a iptables nfqueue rule that will select
 a tcp flow... like this:
@@ -119,6 +172,15 @@ iptables -A OUTPUT -j NFQUEUE --queue-num 0 -p tcp --dport 2666
 
 ***/
 func main() {
+	var ip net.IP
+
+	ipChan := getICMPReponseChan("wlan0")
+
 	n := NewNFQueueTraceroute(3, 66)
 	n.Start()
+
+	for true {
+		ip = <-ipChan
+		log.Printf("ip addr %s\n", ip.String())
+	}
 }
