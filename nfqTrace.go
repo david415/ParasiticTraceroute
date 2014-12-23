@@ -15,10 +15,102 @@ import (
 	"net"
 )
 
+type flowKey [2]gopacket.Flow
+
+type NFQueueTraceObserver struct {
+	packets        <-chan netfilter.NFPacket
+	done           chan bool
+	ipResponseChan <-chan net.IP
+	ResultsChan    chan net.IP
+	targetIP       net.IP
+	iface          string
+	nfq            *netfilter.NFQueue
+	decoded        []gopacket.LayerType
+	ip4            layers.IPv4
+	tcp            layers.TCP
+	parser         *gopacket.DecodingLayerParser
+	flow           flowKey
+	hasFlow        bool
+	nfqTrace       NFQueueTraceroute
+	ttlRepeatMax   int
+	mangleFreq     int
+}
+
+func NewNFQueueTraceObserver(iface string, ttlRepeatMax, mangleFreq int) NFQueueTraceObserver {
+	var err error
+	o := NFQueueTraceObserver{
+		hasFlow:      false,
+		iface:        iface,
+		ResultsChan:  make(chan net.IP),
+		done:         make(chan bool),
+		decoded:      make([]gopacket.LayerType, 0, 4),
+		ttlRepeatMax: ttlRepeatMax,
+		mangleFreq:   mangleFreq,
+	}
+	// XXX adjust these parameters
+	o.nfq, err = netfilter.NewNFQueue(0, 100, netfilter.NF_DEFAULT_PACKET_SIZE)
+	if err != nil {
+		panic(err)
+	}
+	o.packets = o.nfq.GetPackets()
+	return o
+}
+
+// XXX todo: make it compatible with IPv6!
+func (o *NFQueueTraceObserver) Start() {
+	o.ipResponseChan = getICMPReponseChan(o.iface)
+	go o.processResponses()
+
+	o.parser = gopacket.NewDecodingLayerParser(layers.LayerTypeIPv4, &o.ip4, &o.tcp)
+	go func() {
+		for true {
+			select {
+			case p := <-o.packets:
+				o.processPacket(p)
+			case <-o.done:
+				close(o.done)
+				break
+			}
+		}
+	}()
+}
+
+func (o *NFQueueTraceObserver) Stop() {
+	o.done <- true
+	o.nfq.Close()
+}
+
+func (o *NFQueueTraceObserver) processResponses() {
+	var ip net.IP
+	for true {
+		ip = <-o.ipResponseChan
+		if ip.Equal(o.targetIP) {
+			o.Stop()
+		} else {
+			o.ResultsChan <- ip
+		}
+	}
+}
+
+// XXX todo: make it compatible with IPv6!
+func (o *NFQueueTraceObserver) processPacket(p netfilter.NFPacket) {
+	key := flowKey{o.ip4.NetworkFlow(), o.tcp.TransportFlow()}
+	if o.hasFlow == false {
+		o.hasFlow = true
+		o.flow = key
+		o.targetIP = o.ip4.DstIP
+		o.nfqTrace = NewNFQueueTraceroute(o.ttlRepeatMax, o.mangleFreq)
+	} else {
+		if key != o.flow {
+			// ignore the other flows
+			p.SetVerdict(netfilter.NF_ACCEPT)
+			return
+		}
+	}
+	o.nfqTrace.processPacket(p)
+}
+
 type NFQueueTraceroute struct {
-	q            *netfilter.NFQueue
-	packets      <-chan netfilter.NFPacket
-	done         chan bool
 	ttl          uint8
 	ttlRepeat    int
 	ttlRepeatMax int
@@ -38,36 +130,6 @@ func NewNFQueueTraceroute(ttlRepeatMax, mangleFreq int) NFQueueTraceroute {
 	nfqTrace.ttl = 1
 	nfqTrace.count = 1
 	return nfqTrace
-}
-
-// XXX perhaps make the infinite for loop execute in another goroutine?
-func (n *NFQueueTraceroute) Start() {
-	var err error
-	// XXX adjust these parameters
-	n.q, err = netfilter.NewNFQueue(0, 100, netfilter.NF_DEFAULT_PACKET_SIZE)
-	if err != nil {
-		panic(err)
-	}
-
-	n.done = make(chan bool)
-	n.packets = n.q.GetPackets()
-
-	go func() {
-		for true {
-			select {
-			case p := <-n.packets:
-				n.processPacket(p)
-			case <-n.done:
-				close(n.done)
-				break
-			}
-		}
-	}()
-}
-
-func (n *NFQueueTraceroute) Stop() {
-	n.done <- true
-	n.q.Close()
 }
 
 // return the next TTL which shall be used to conduct a traceroute
@@ -172,15 +234,12 @@ iptables -A OUTPUT -j NFQUEUE --queue-num 0 -p tcp --dport 2666
 
 ***/
 func main() {
-	var ip net.IP
-
-	ipChan := getICMPReponseChan("wlan0")
-
-	n := NewNFQueueTraceroute(3, 66)
-	n.Start()
+	o := NewNFQueueTraceObserver("wlan0", 3, 66)
+	o.Start()
 
 	for true {
-		ip = <-ipChan
-		log.Printf("ip addr %s\n", ip.String())
+		ip := <-o.ResultsChan
+		log.Printf("%s\n", ip.String())
 	}
+	// XXX
 }
