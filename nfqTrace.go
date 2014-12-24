@@ -10,6 +10,7 @@ import (
 	"code.google.com/p/gopacket"
 	"code.google.com/p/gopacket/layers"
 	"code.google.com/p/gopacket/pcap"
+	"encoding/binary"
 	"github.com/david415/go-netfilter-queue"
 	"log"
 	"net"
@@ -278,17 +279,48 @@ func serializeWithTTL(p gopacket.Packet, ttl uint8) []byte {
 	return rawPacketBuf.Bytes()
 }
 
+// note: a "TCP Head" is the first 8 bytes of the TCP Header.
+// We use this to deal with rfc792 implementations where
+// the original packet is NOT sent back via ICMP payload but
+// instead 8 bytes of the original packet are sent.
+// https://tools.ietf.org/html/rfc792
+// returns SrcPort, DstPort and Sequence number
+func getFlowFromTCPHead(data []byte) (layers.TCPPort, layers.TCPPort, uint32) {
+	var srcPort, dstPort layers.TCPPort
+	var seq uint32
+	srcPort = layers.TCPPort(binary.BigEndian.Uint16(data[0:2]))
+	dstPort = layers.TCPPort(binary.BigEndian.Uint16(data[2:4]))
+	seq = binary.BigEndian.Uint32(data[4:8])
+	return srcPort, dstPort, seq
+}
+
 // given a byte array packet return a tcp/ip flow
 func getPacketFlow(packet []byte) (flowKey, error) {
 	var ip layers.IPv4
 	var tcp layers.TCP
 	var flow flowKey
-	//decoded := make([]gopacket.LayerType, 0, 4)
+
 	decoded := []gopacket.LayerType{}
 	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeIPv4, &ip, &tcp)
 	err := parser.DecodeLayers(packet, &decoded)
+
 	if err != nil {
-		return flow, err
+		tcpHead := packet[len(packet)-8 : len(packet)]
+		srcPort, dstPort, _ := getFlowFromTCPHead(tcpHead)
+
+		// XXX convert to tcp/ip flow
+		tcpSrc := layers.NewTCPPortEndpoint(srcPort)
+		tcpDst := layers.NewTCPPortEndpoint(dstPort)
+		tcpFlow, err := gopacket.FlowFromEndpoints(tcpSrc, tcpDst)
+
+		if err != nil {
+			// we should never hit this condition
+			// because it only happens if the two endpoints
+			// are of mismatched type
+			return flow, err
+		} else {
+			return flowKey{ip.NetworkFlow(), tcpFlow}, nil
+		}
 	}
 	flow = flowKey{ip.NetworkFlow(), tcp.TransportFlow()}
 	return flow, nil
