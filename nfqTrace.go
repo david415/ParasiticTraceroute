@@ -13,62 +13,105 @@ import (
 	"github.com/david415/go-netfilter-queue"
 	"log"
 	"net"
+	"sync"
 )
 
 type flowKey [2]gopacket.Flow
 
-type NFQueueTraceObserver struct {
-	packets        <-chan netfilter.NFPacket
-	done           chan bool
-	ipResponseChan <-chan net.IP
-	ResultsChan    chan net.IP
-	targetIP       net.IP
-	iface          string
-	nfq            *netfilter.NFQueue
-	decoded        []gopacket.LayerType
-	ip4            layers.IPv4
-	tcp            layers.TCP
-	parser         *gopacket.DecodingLayerParser
-	flow           flowKey
-	hasFlow        bool
-	nfqTrace       NFQueueTraceroute
-	ttlRepeatMax   int
-	mangleFreq     int
+type FlowTracker struct {
+	lock    *sync.RWMutex
+	flowMap map[flowKey]*NFQueueTraceroute
 }
 
-func NewNFQueueTraceObserver(iface string, ttlRepeatMax, mangleFreq int) NFQueueTraceObserver {
+func NewFlowTracker() *FlowTracker {
+	return &FlowTracker{
+		lock:    new(sync.RWMutex),
+		flowMap: make(map[flowKey]*NFQueueTraceroute),
+	}
+}
+
+func (f *FlowTracker) HasFlow(flow flowKey) bool {
+	f.lock.RLock()
+	_, ok := f.flowMap[flow]
+	f.lock.RUnlock()
+	return ok
+}
+
+func (f *FlowTracker) AddFlow(flow flowKey, nfqTrace *NFQueueTraceroute) {
+	f.lock.Lock()
+	f.flowMap[flow] = nfqTrace
+	f.lock.Unlock()
+}
+
+func (f *FlowTracker) GetFlow(flow flowKey) *NFQueueTraceroute {
+	f.lock.RLock()
+	ret := f.flowMap[flow]
+	f.lock.RUnlock()
+	return ret
+}
+
+type NFQueueTraceObserver struct {
+	flowTracker FlowTracker
+	nfq         *netfilter.NFQueue
+
+	// packet channel for interacting with NFQueue
+	packets <-chan netfilter.NFPacket
+
+	// this is used to stop all the traceroutes
+	done chan bool
+
+	// signal our calling party that we are finished
+	// XXX get rid of this?
+	finished chan bool
+
+	// network interface to listen for ICMP responses
+	iface string
+
+	// used for packet decoding
+	decoded []gopacket.LayerType
+	ip4     layers.IPv4
+	tcp     layers.TCP
+	parser  *gopacket.DecodingLayerParser
+
+	// these get passed to NFQueueTraceroute
+	ttlRepeatMax int
+	mangleFreq   int
+}
+
+func NewNFQueueTraceObserver(iface string, ttlRepeatMax, mangleFreq int) *NFQueueTraceObserver {
 	var err error
 	o := NFQueueTraceObserver{
-		hasFlow:      false,
 		iface:        iface,
-		ResultsChan:  make(chan net.IP),
 		done:         make(chan bool),
+		finished:     make(chan bool),
 		decoded:      make([]gopacket.LayerType, 0, 4),
 		ttlRepeatMax: ttlRepeatMax,
 		mangleFreq:   mangleFreq,
 	}
+
+	flowTracker := NewFlowTracker()
+	o.flowTracker = *flowTracker
 	// XXX adjust these parameters
 	o.nfq, err = netfilter.NewNFQueue(0, 100, netfilter.NF_DEFAULT_PACKET_SIZE)
 	if err != nil {
 		panic(err)
 	}
 	o.packets = o.nfq.GetPackets()
-	return o
+	return &o
 }
 
 // XXX todo: make it compatible with IPv6!
 func (o *NFQueueTraceObserver) Start() {
-	o.ipResponseChan = getICMPReponseChan(o.iface)
-	go o.processResponses()
-
 	o.parser = gopacket.NewDecodingLayerParser(layers.LayerTypeIPv4, &o.ip4, &o.tcp)
+	o.startReceivingReplies()
 	go func() {
 		for true {
 			select {
 			case p := <-o.packets:
 				o.processPacket(p)
 			case <-o.done:
-				close(o.done)
+				o.nfq.Close()
+				close(o.done) // XXX necessary?
 				break
 			}
 		}
@@ -77,37 +120,78 @@ func (o *NFQueueTraceObserver) Start() {
 
 func (o *NFQueueTraceObserver) Stop() {
 	o.done <- true
-	o.nfq.Close()
-}
-
-func (o *NFQueueTraceObserver) processResponses() {
-	var ip net.IP
-	for true {
-		ip = <-o.ipResponseChan
-		if ip.Equal(o.targetIP) {
-			o.Stop()
-		} else {
-			o.ResultsChan <- ip
-		}
-	}
 }
 
 // XXX todo: make it compatible with IPv6!
+// XXX make the locking more efficient?
 func (o *NFQueueTraceObserver) processPacket(p netfilter.NFPacket) {
-	key := flowKey{o.ip4.NetworkFlow(), o.tcp.TransportFlow()}
-	if o.hasFlow == false {
-		o.hasFlow = true
-		o.flow = key
-		o.targetIP = o.ip4.DstIP
-		o.nfqTrace = NewNFQueueTraceroute(o.ttlRepeatMax, o.mangleFreq)
-	} else {
-		if key != o.flow {
-			// ignore the other flows
-			p.SetVerdict(netfilter.NF_ACCEPT)
-			return
-		}
+	flow := flowKey{o.ip4.NetworkFlow(), o.tcp.TransportFlow()}
+	if o.flowTracker.HasFlow(flow) == false {
+		nfqTrace := NewNFQueueTraceroute(o.ttlRepeatMax, o.mangleFreq)
+		o.flowTracker.AddFlow(flow, nfqTrace)
 	}
-	o.nfqTrace.processPacket(p)
+	nfqTrace := o.flowTracker.GetFlow(flow)
+	(*nfqTrace).processPacket(p)
+}
+
+// return a net.IP channel to report all the ICMP reponse SrcIP addresses
+// that have the ICMP time exceeded flag set
+// XXX fixme: make me compatible with ipv6
+func (o *NFQueueTraceObserver) startReceivingReplies() {
+	snaplen := 65536
+	filter := "icmp" // the idea here is to capture only ICMP packets
+
+	var eth layers.Ethernet
+	var ip layers.IPv4
+	var icmp layers.ICMPv4
+	var payload gopacket.Payload
+	var flow flowKey
+
+	decoded := make([]gopacket.LayerType, 0, 4)
+
+	handle, err := pcap.OpenLive(o.iface, int32(snaplen), true, pcap.BlockForever)
+	if err != nil {
+		log.Fatal("error opening pcap handle: ", err)
+	}
+	if err := handle.SetBPFFilter(filter); err != nil {
+		log.Fatal("error setting BPF filter: ", err)
+	}
+
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip, &icmp, &payload)
+
+	go func() {
+		for true {
+			data, _, err := handle.ReadPacketData()
+			if err != nil {
+				continue
+			}
+			err = parser.DecodeLayers(data, &decoded)
+			if err != nil {
+				continue
+			}
+			typ := uint8(icmp.TypeCode >> 8)
+			if typ == layers.ICMPv4TypeTimeExceeded {
+				flow, err = getPacketFlow(payload)
+				if err != nil {
+					continue // ignore payloads we fail to parse
+				}
+				if o.flowTracker.HasFlow(flow) == false {
+					// ignore ICMP ttl expire packets that are for flows other than the ones we are currently tracking
+					log.Print("icmp payload NOT matched tracked flow\n")
+					continue
+				}
+
+				log.Print("icmp payload matched tracked flow\n")
+				nfqTrace := o.flowTracker.GetFlow(flow)
+				finished := nfqTrace.replyReceived(ip.SrcIP, ip.TTL)
+
+				if finished {
+					log.Print("Finished.\n")
+					break
+				}
+			}
+		}
+	}()
 }
 
 type NFQueueTraceroute struct {
@@ -116,20 +200,22 @@ type NFQueueTraceroute struct {
 	ttlRepeatMax int
 	mangleFreq   int
 	count        int
+	traceResult  map[uint8][]net.IP // ip.TTL -> list of ip addrs
 }
 
 // conduct an nfqueue tcp traceroute;
 // - send each TTL out ttlRepeatMax number of times.
 // - only mangle a packet's TTL after mangleFreq number
 // of packets have traversed the flow
-func NewNFQueueTraceroute(ttlRepeatMax, mangleFreq int) NFQueueTraceroute {
-	var nfqTrace = NFQueueTraceroute{}
-	nfqTrace.mangleFreq = mangleFreq
-	nfqTrace.ttlRepeatMax = ttlRepeatMax
-	nfqTrace.ttlRepeat = 1
-	nfqTrace.ttl = 1
-	nfqTrace.count = 1
-	return nfqTrace
+func NewNFQueueTraceroute(ttlRepeatMax, mangleFreq int) *NFQueueTraceroute {
+	return &NFQueueTraceroute{
+		ttl:          1,
+		ttlRepeat:    1,
+		ttlRepeatMax: ttlRepeatMax,
+		mangleFreq:   mangleFreq,
+		count:        1,
+		traceResult:  make(map[uint8][]net.IP),
+	}
 }
 
 // return the next TTL which shall be used to conduct a traceroute
@@ -147,17 +233,30 @@ func (n *NFQueueTraceroute) nextTTL() uint8 {
 // for our tracerouting purposes. we mangle a packet's TTL only
 // after we've seen mangleFreq number of packets traverse the flow.
 func (n *NFQueueTraceroute) processPacket(p netfilter.NFPacket) {
-	n.count += 1
 	if n.count%n.mangleFreq == 0 {
 		p.SetModifiedVerdict(netfilter.NF_ACCEPT, serializeWithTTL(p.Packet, n.nextTTL()))
 	} else {
 		p.SetVerdict(netfilter.NF_ACCEPT)
 	}
+	n.count = n.count + 1
 }
 
-// XXX fixme: make me work with IPv6!
+// process the "reply" (icmp ttl expired packet with payload matching this flow)
+// and return true if the trace is "complete"
+// XXX how to detect trace-completed condition?
+func (n *NFQueueTraceroute) replyReceived(ip net.IP, ttl uint8) bool {
+	log.Print("replyReceived\n")
+
+	finished := false
+	n.traceResult[ttl] = append(n.traceResult[ttl], ip)
+	log.Printf("ttl %d ip %s\n", ttl, ip.String())
+	// XXX
+	return finished
+}
+
 // This function takes a gopacket.Packet and a TTL
 // and returns a byte array of the serialized packet with the specified TTL
+// XXX fixme: make me work with IPv6!
 func serializeWithTTL(p gopacket.Packet, ttl uint8) []byte {
 	ipLayer := p.Layer(layers.LayerTypeIPv4)
 	if ipLayer == nil {
@@ -182,64 +281,33 @@ func serializeWithTTL(p gopacket.Packet, ttl uint8) []byte {
 	return rawPacketBuf.Bytes()
 }
 
-// return a net.IP channel to report all the ICMP reponse SrcIP addresses
-// that have the ICMP time exceeded flag set
-func getICMPReponseChan(iface string) <-chan net.IP {
-	snaplen := 65536
-	filter := "icmp" // the idea here is to capture only ICMP packets
-
-	var eth layers.Ethernet
-	var ip4 layers.IPv4
-	var icmp layers.ICMPv4
-	var payload gopacket.Payload
-
-	ipChan := make(chan net.IP)
-	decoded := make([]gopacket.LayerType, 0, 4)
-
-	handle, err := pcap.OpenLive(iface, int32(snaplen), true, pcap.BlockForever)
+// given a byte array packet return a tcp/ip flow
+func getPacketFlow(packet []byte) (flowKey, error) {
+	var ip layers.IPv4
+	var tcp layers.TCP
+	var flow flowKey
+	//decoded := make([]gopacket.LayerType, 0, 4)
+	decoded := []gopacket.LayerType{}
+	//parser := gopacket.NewDecodingLayerParser(layers.LayerTypeIPv4, &ip)
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeIPv4, &ip, &tcp)
+	err := parser.DecodeLayers(packet, &decoded)
 	if err != nil {
-		log.Fatal("error opening pcap handle: ", err)
+		return flow, err
 	}
-	if err := handle.SetBPFFilter(filter); err != nil {
-		log.Fatal("error setting BPF filter: ", err)
-	}
-
-	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip4, &icmp, &payload)
-
-	go func() {
-		for true {
-			data, _, err := handle.ReadPacketData()
-			if err != nil {
-				continue
-			}
-
-			err = parser.DecodeLayers(data, &decoded)
-			if err != nil {
-				continue
-			}
-
-			typ := uint8(icmp.TypeCode >> 8)
-			if typ == layers.ICMPv4TypeTimeExceeded {
-				ipChan <- ip4.SrcIP
-			}
-		}
-	}()
-	return ipChan
+	// XXX
+	flow = flowKey{ip.NetworkFlow(), tcp.TransportFlow()}
+	return flow, nil
 }
 
 /***
-use this rough POC with a iptables nfqueue rule that will select
-a tcp flow... like this:
+use this rough POC with an iptables nfqueue rule that will select
+a tcp flow direction like this:
 iptables -A OUTPUT -j NFQUEUE --queue-num 0 -p tcp --dport 2666
 
 ***/
 func main() {
 	o := NewNFQueueTraceObserver("wlan0", 3, 66)
 	o.Start()
-
-	for true {
-		ip := <-o.ResultsChan
-		log.Printf("%s\n", ip.String())
-	}
+	<-o.finished
 	// XXX
 }
