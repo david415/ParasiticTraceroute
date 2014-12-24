@@ -51,7 +51,7 @@ func (f *FlowTracker) GetFlow(flow flowKey) *NFQueueTraceroute {
 }
 
 type NFQueueTraceObserver struct {
-	flowTracker FlowTracker
+	flowTracker *FlowTracker
 	nfq         *netfilter.NFQueue
 
 	// packet channel for interacting with NFQueue
@@ -67,12 +67,6 @@ type NFQueueTraceObserver struct {
 	// network interface to listen for ICMP responses
 	iface string
 
-	// used for packet decoding
-	decoded []gopacket.LayerType
-	ip4     layers.IPv4
-	tcp     layers.TCP
-	parser  *gopacket.DecodingLayerParser
-
 	// these get passed to NFQueueTraceroute
 	ttlRepeatMax int
 	mangleFreq   int
@@ -84,13 +78,12 @@ func NewNFQueueTraceObserver(iface string, ttlRepeatMax, mangleFreq int) *NFQueu
 		iface:        iface,
 		done:         make(chan bool),
 		finished:     make(chan bool),
-		decoded:      make([]gopacket.LayerType, 0, 4),
 		ttlRepeatMax: ttlRepeatMax,
 		mangleFreq:   mangleFreq,
 	}
 
 	flowTracker := NewFlowTracker()
-	o.flowTracker = *flowTracker
+	o.flowTracker = flowTracker
 	// XXX adjust these parameters
 	o.nfq, err = netfilter.NewNFQueue(0, 100, netfilter.NF_DEFAULT_PACKET_SIZE)
 	if err != nil {
@@ -102,7 +95,6 @@ func NewNFQueueTraceObserver(iface string, ttlRepeatMax, mangleFreq int) *NFQueu
 
 // XXX todo: make it compatible with IPv6!
 func (o *NFQueueTraceObserver) Start() {
-	o.parser = gopacket.NewDecodingLayerParser(layers.LayerTypeIPv4, &o.ip4, &o.tcp)
 	o.startReceivingReplies()
 	go func() {
 		for true {
@@ -125,13 +117,22 @@ func (o *NFQueueTraceObserver) Stop() {
 // XXX todo: make it compatible with IPv6!
 // XXX make the locking more efficient?
 func (o *NFQueueTraceObserver) processPacket(p netfilter.NFPacket) {
-	flow := flowKey{o.ip4.NetworkFlow(), o.tcp.TransportFlow()}
+	ipLayer := p.Packet.Layer(layers.LayerTypeIPv4)
+	tcpLayer := p.Packet.Layer(layers.LayerTypeTCP)
+	if ipLayer == nil || tcpLayer == nil {
+		// ignore non-tcp/ip packets
+		return
+	}
+	ip, _ := ipLayer.(*layers.IPv4)
+	tcp, _ := tcpLayer.(*layers.TCP)
+
+	flow := flowKey{ip.NetworkFlow(), tcp.TransportFlow()}
 	if o.flowTracker.HasFlow(flow) == false {
 		nfqTrace := NewNFQueueTraceroute(o.ttlRepeatMax, o.mangleFreq)
 		o.flowTracker.AddFlow(flow, nfqTrace)
 	}
 	nfqTrace := o.flowTracker.GetFlow(flow)
-	(*nfqTrace).processPacket(p)
+	nfqTrace.processPacket(p)
 }
 
 // return a net.IP channel to report all the ICMP reponse SrcIP addresses
@@ -177,11 +178,8 @@ func (o *NFQueueTraceObserver) startReceivingReplies() {
 				}
 				if o.flowTracker.HasFlow(flow) == false {
 					// ignore ICMP ttl expire packets that are for flows other than the ones we are currently tracking
-					log.Print("icmp payload NOT matched tracked flow\n")
 					continue
 				}
-
-				log.Print("icmp payload matched tracked flow\n")
 				nfqTrace := o.flowTracker.GetFlow(flow)
 				finished := nfqTrace.replyReceived(ip.SrcIP, ip.TTL)
 
@@ -214,7 +212,7 @@ func NewNFQueueTraceroute(ttlRepeatMax, mangleFreq int) *NFQueueTraceroute {
 		ttlRepeatMax: ttlRepeatMax,
 		mangleFreq:   mangleFreq,
 		count:        1,
-		traceResult:  make(map[uint8][]net.IP),
+		traceResult:  make(map[uint8][]net.IP, 1),
 	}
 }
 
@@ -234,7 +232,8 @@ func (n *NFQueueTraceroute) nextTTL() uint8 {
 // after we've seen mangleFreq number of packets traverse the flow.
 func (n *NFQueueTraceroute) processPacket(p netfilter.NFPacket) {
 	if n.count%n.mangleFreq == 0 {
-		p.SetModifiedVerdict(netfilter.NF_ACCEPT, serializeWithTTL(p.Packet, n.nextTTL()))
+		// repeat means we send out a duplicate packet
+		p.SetModifiedVerdict(netfilter.NF_REPEAT, serializeWithTTL(p.Packet, n.nextTTL()))
 	} else {
 		p.SetVerdict(netfilter.NF_ACCEPT)
 	}
@@ -245,8 +244,6 @@ func (n *NFQueueTraceroute) processPacket(p netfilter.NFPacket) {
 // and return true if the trace is "complete"
 // XXX how to detect trace-completed condition?
 func (n *NFQueueTraceroute) replyReceived(ip net.IP, ttl uint8) bool {
-	log.Print("replyReceived\n")
-
 	finished := false
 	n.traceResult[ttl] = append(n.traceResult[ttl], ip)
 	log.Printf("ttl %d ip %s\n", ttl, ip.String())
@@ -288,13 +285,11 @@ func getPacketFlow(packet []byte) (flowKey, error) {
 	var flow flowKey
 	//decoded := make([]gopacket.LayerType, 0, 4)
 	decoded := []gopacket.LayerType{}
-	//parser := gopacket.NewDecodingLayerParser(layers.LayerTypeIPv4, &ip)
 	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeIPv4, &ip, &tcp)
 	err := parser.DecodeLayers(packet, &decoded)
 	if err != nil {
 		return flow, err
 	}
-	// XXX
 	flow = flowKey{ip.NetworkFlow(), tcp.TransportFlow()}
 	return flow, nil
 }
