@@ -321,19 +321,28 @@ func (n *NFQueueTraceroute) processPacket(p netfilter.NFPacket) {
 	}
 
 	if n.count%n.mangleFreq == 0 {
-		log.Printf("processPacket mangle case ttl %d\n", n.ttl)
+		log.Printf("processPacket mangle case n.ttl %d, n.ttlRepeat %d, n.ttlRepeatMax %d\n", n.ttl, n.ttlRepeat, n.ttlRepeatMax)
 
 		n.ttlRepeat += 1
 
 		if n.responseTimedOut {
 			n.ttl += 1
 			n.ttlRepeat = 0
+			n.responseTimedOut = false
 			n.restartTimerChannel <- true
-		} else if n.ttlRepeat >= n.ttlRepeatMax {
+		} else if n.ttlRepeat == n.ttlRepeatMax {
 			log.Print("ttlRepeatMax reached case\n")
 			n.ttl += 1
 			n.ttlRepeat = 0
+			n.responseTimedOut = false
 			n.restartTimerChannel <- true
+		}
+
+		// terminate trace upon max ttl and ttlRepeatMax conditions
+		if n.ttl > n.ttlMax && n.ttlRepeat == (n.ttlRepeatMax-1) {
+			n.Stop()
+			p.SetVerdict(netfilter.NF_ACCEPT)
+			return
 		}
 
 		p.SetModifiedVerdict(netfilter.NF_REPEAT, serializeWithTTL(p.Packet, n.ttl))
