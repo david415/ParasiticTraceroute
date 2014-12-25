@@ -1,11 +1,33 @@
 /*
-Parasitic forward/reverse Linux-Netfilter Queue traceroute
-for penetrating network address tranlation devices...
-tracing the client's internal network.
-
-software license: MIT
-author: david stainton
-*/
+ * nfqTrace.go - Forward/Reverse TCP traceroute using Linux NFQueue
+ * Copyright (c) 2014 David Anthony Stainton
+ *
+ * Abstract:
+ * Parasitic forward/reverse Linux-Netfilter Queue traceroute
+ * for penetrating network address translation devices...
+ * tracing the client's internal network.
+ *
+ * The MIT License (MIT)
+ * Copyright (c) 2014 David Anthony Stainton
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ *
+ */
 
 package main
 
@@ -18,12 +40,18 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
+)
+
+const (
+	MAX_TTL uint8 = 255
 )
 
 // this is a composite struct type called "flowKey"
 // used to track tcp/ip flows... as a hashmap key.
 type flowKey [2]gopacket.Flow
 
+// concurrent-safe hashmap of tcp/ip-flowKeys to NFQueueTraceroute`s
 type FlowTracker struct {
 	lock    *sync.RWMutex
 	flowMap map[flowKey]*NFQueueTraceroute
@@ -49,14 +77,31 @@ func (f *FlowTracker) AddFlow(flow flowKey, nfqTrace *NFQueueTraceroute) {
 	f.lock.Unlock()
 }
 
-func (f *FlowTracker) GetFlow(flow flowKey) *NFQueueTraceroute {
+func (f *FlowTracker) Delete(flow flowKey) {
+	f.lock.Lock()
+	delete(f.flowMap, flow)
+	f.lock.Unlock()
+}
+
+func (f *FlowTracker) GetFlowTrace(flow flowKey) *NFQueueTraceroute {
 	f.lock.RLock()
 	ret := f.flowMap[flow]
 	f.lock.RUnlock()
 	return ret
 }
 
+type NFQueueTraceObserverOptions struct {
+	// network interface to listen for ICMP responses
+	iface        string
+	ttlMax       uint8
+	ttlRepeatMax int
+	mangleFreq   int
+}
+
 type NFQueueTraceObserver struct {
+	// passed in from the user in our constructor...
+	options NFQueueTraceObserverOptions
+
 	flowTracker *FlowTracker
 	nfq         *netfilter.NFQueue
 
@@ -69,23 +114,14 @@ type NFQueueTraceObserver struct {
 	// signal our calling party that we are finished
 	// XXX get rid of this?
 	finished chan bool
-
-	// network interface to listen for ICMP responses
-	iface string
-
-	// these get passed to NFQueueTraceroute
-	ttlRepeatMax int
-	mangleFreq   int
 }
 
-func NewNFQueueTraceObserver(iface string, ttlRepeatMax, mangleFreq int) *NFQueueTraceObserver {
+func NewNFQueueTraceObserver(options NFQueueTraceObserverOptions) *NFQueueTraceObserver {
 	var err error
 	o := NFQueueTraceObserver{
-		iface:        iface,
-		done:         make(chan bool),
-		finished:     make(chan bool),
-		ttlRepeatMax: ttlRepeatMax,
-		mangleFreq:   mangleFreq,
+		options:  options,
+		done:     make(chan bool),
+		finished: make(chan bool),
 	}
 
 	flowTracker := NewFlowTracker()
@@ -99,7 +135,6 @@ func NewNFQueueTraceObserver(iface string, ttlRepeatMax, mangleFreq int) *NFQueu
 	return &o
 }
 
-// XXX todo: make it compatible with IPv6!
 func (o *NFQueueTraceObserver) Start() {
 	o.startReceivingReplies()
 	go func() {
@@ -110,6 +145,7 @@ func (o *NFQueueTraceObserver) Start() {
 			case <-o.done:
 				o.nfq.Close()
 				close(o.done) // XXX necessary?
+				// XXX todo: stop other goroutines
 				break
 			}
 		}
@@ -120,7 +156,6 @@ func (o *NFQueueTraceObserver) Stop() {
 	o.done <- true
 }
 
-// XXX todo: make it compatible with IPv6!
 // XXX make the locking more efficient?
 func (o *NFQueueTraceObserver) processPacket(p netfilter.NFPacket) {
 	ipLayer := p.Packet.Layer(layers.LayerTypeIPv4)
@@ -134,16 +169,15 @@ func (o *NFQueueTraceObserver) processPacket(p netfilter.NFPacket) {
 
 	flow := flowKey{ip.NetworkFlow(), tcp.TransportFlow()}
 	if o.flowTracker.HasFlow(flow) == false {
-		nfqTrace := NewNFQueueTraceroute(o.ttlRepeatMax, o.mangleFreq)
+		nfqTrace := NewNFQueueTraceroute(o.options.ttlMax, o.options.ttlRepeatMax, o.options.mangleFreq)
 		o.flowTracker.AddFlow(flow, nfqTrace)
 	}
-	nfqTrace := o.flowTracker.GetFlow(flow)
+	nfqTrace := o.flowTracker.GetFlowTrace(flow)
 	nfqTrace.processPacket(p)
 }
 
 // return a net.IP channel to report all the ICMP reponse SrcIP addresses
 // that have the ICMP time exceeded flag set
-// XXX fixme: make me compatible with ipv6
 func (o *NFQueueTraceObserver) startReceivingReplies() {
 	snaplen := 65536
 	filter := "icmp" // the idea here is to capture only ICMP packets
@@ -156,7 +190,7 @@ func (o *NFQueueTraceObserver) startReceivingReplies() {
 
 	decoded := make([]gopacket.LayerType, 0, 4)
 
-	handle, err := pcap.OpenLive(o.iface, int32(snaplen), true, pcap.BlockForever)
+	handle, err := pcap.OpenLive(o.options.iface, int32(snaplen), true, pcap.BlockForever)
 	if err != nil {
 		log.Fatal("error opening pcap handle: ", err)
 	}
@@ -177,92 +211,151 @@ func (o *NFQueueTraceObserver) startReceivingReplies() {
 				continue
 			}
 			typ := uint8(icmp.TypeCode >> 8)
-			if typ == layers.ICMPv4TypeTimeExceeded {
-
-				// XXX todo: check that the IP header protocol value is set to TCP
-
-				flow = getPacketFlow(payload)
-
-				// XXX it feels dirty to have the mutex around the hashmap
-				// i'm thinking about using channels instead...
-				if o.flowTracker.HasFlow(flow) == false {
-					// ignore ICMP ttl expire packets that are for flows other than the ones we are currently tracking
-					continue
-				}
-				nfqTrace := o.flowTracker.GetFlow(flow)
-				finished := nfqTrace.replyReceived(ip.SrcIP, ip.TTL)
-
-				if finished {
-					log.Print("Finished.\n")
-					break
-				}
+			if typ != layers.ICMPv4TypeTimeExceeded {
+				continue
 			}
+
+			// XXX todo: check that the IP header protocol value is set to TCP
+			flow = getPacketFlow(payload)
+
+			// XXX it feels dirty to have the mutex around the hashmap
+			// i'm thinking about using channels instead...
+			if o.flowTracker.HasFlow(flow) == false {
+				// ignore ICMP ttl expire packets that are for flows other than the ones we are currently tracking
+				continue
+			}
+
+			nfqTrace := o.flowTracker.GetFlowTrace(flow)
+			nfqTrace.replyReceived(ip.SrcIP)
 		}
 	}()
 }
 
 type NFQueueTraceroute struct {
 	ttl          uint8
+	ttlMax       uint8
 	ttlRepeat    int
 	ttlRepeatMax int
 	mangleFreq   int
 	count        int
-	traceResult  map[uint8][]net.IP // ip.TTL -> list of ip addrs
+
+	// ip.TTL -> list of ip addrs
+	traceResult map[uint8][]net.IP
+
+	stopped          bool
+	responseTimedOut bool
+
+	// XXX should it be a pointer instead?
+	receivePacketChannel chan netfilter.NFPacket
+
+	resumeTimerChannel  chan bool
+	stopTimerChannel    chan bool
+	restartTimerChannel chan bool
 }
 
 // conduct an nfqueue tcp traceroute;
 // - send each TTL out ttlRepeatMax number of times.
 // - only mangle a packet's TTL after mangleFreq number
 // of packets have traversed the flow
-func NewNFQueueTraceroute(ttlRepeatMax, mangleFreq int) *NFQueueTraceroute {
-	return &NFQueueTraceroute{
-		ttl:          1,
-		ttlRepeat:    1,
-		ttlRepeatMax: ttlRepeatMax,
-		mangleFreq:   mangleFreq,
-		count:        1,
-		traceResult:  make(map[uint8][]net.IP, 1),
+func NewNFQueueTraceroute(ttlMax uint8, ttlRepeatMax, mangleFreq int) *NFQueueTraceroute {
+	log.Print("NewNFQueueTraceroute\n")
+	nfqTrace := NFQueueTraceroute{
+		ttl:                 1,
+		ttlMax:              ttlMax,
+		ttlRepeat:           1,
+		ttlRepeatMax:        ttlRepeatMax,
+		mangleFreq:          mangleFreq,
+		count:               1,
+		traceResult:         make(map[uint8][]net.IP, 1),
+		stopped:             false,
+		responseTimedOut:    false,
+		stopTimerChannel:    make(chan bool),
+		restartTimerChannel: make(chan bool),
 	}
+	nfqTrace.StartResponseTimer()
+	return &nfqTrace
 }
 
-// return the next TTL which shall be used to conduct a traceroute
-// each TTL is used n.ttlRepeatMax number of times.
-func (n *NFQueueTraceroute) nextTTL() uint8 {
-	n.ttlRepeat += 1
-	if n.ttlRepeat >= n.ttlRepeatMax {
-		n.ttl += 1
-		n.ttlRepeat = 0
-	}
-	return n.ttl
+func (n *NFQueueTraceroute) StartResponseTimer() {
+	log.Print("StartResponseTimer\n")
+
+	go func() {
+		for {
+			select {
+			case <-time.After(time.Duration(200) * time.Second):
+				log.Print("TimerExpired\n")
+
+				if n.ttl >= n.ttlMax && n.ttlRepeat >= n.ttlRepeatMax {
+					n.Stop()
+					return
+				}
+
+				n.responseTimedOut = true
+			case <-n.restartTimerChannel:
+				log.Print("restartTimerChannel fired\n")
+				continue
+			case <-n.stopTimerChannel:
+				log.Print("stopTimerChannel fired\n")
+				return
+			}
+		}
+	}()
+}
+
+func (n *NFQueueTraceroute) Stop() {
+	log.Print("NFQueueTraceroute.Stop()\n")
+	n.stopped = true
+	n.stopTimerChannel <- true
+	close(n.stopTimerChannel)
+	close(n.restartTimerChannel)
+
 }
 
 // given a packet we decided weather or not to mangle the TTL
-// for our tracerouting purposes. we mangle a packet's TTL only
-// after we've seen mangleFreq number of packets traverse the flow.
+// for our tracerouting purposes.
 func (n *NFQueueTraceroute) processPacket(p netfilter.NFPacket) {
+
+	if n.stopped {
+		p.SetVerdict(netfilter.NF_ACCEPT)
+		return
+	}
+
 	if n.count%n.mangleFreq == 0 {
-		// repeat means we send out a duplicate packet
-		p.SetModifiedVerdict(netfilter.NF_REPEAT, serializeWithTTL(p.Packet, n.nextTTL()))
+		log.Printf("processPacket mangle case ttl %d\n", n.ttl)
+
+		n.ttlRepeat += 1
+
+		if n.responseTimedOut {
+			n.ttl += 1
+			n.ttlRepeat = 0
+			n.restartTimerChannel <- true
+		} else if n.ttlRepeat >= n.ttlRepeatMax {
+			log.Print("ttlRepeatMax reached case\n")
+			n.ttl += 1
+			n.ttlRepeat = 0
+			n.restartTimerChannel <- true
+		}
+
+		p.SetModifiedVerdict(netfilter.NF_REPEAT, serializeWithTTL(p.Packet, n.ttl))
 	} else {
 		p.SetVerdict(netfilter.NF_ACCEPT)
 	}
 	n.count = n.count + 1
 }
 
-// process the "reply" (icmp ttl expired packet with payload matching this flow)
-// and return true if the trace is "complete"
-// XXX how to detect trace-completed condition?
-func (n *NFQueueTraceroute) replyReceived(ip net.IP, ttl uint8) bool {
-	finished := false
-	n.traceResult[ttl] = append(n.traceResult[ttl], ip)
-	log.Printf("ttl %d ip %s\n", ttl, ip.String())
-	// XXX
-	return finished
+// XXX
+// store the "reply" source ip address (icmp ttl expired packet with payload matching this flow)
+func (n *NFQueueTraceroute) replyReceived(ip net.IP) {
+	log.Printf("replyReceived: ttl %d ip %s\n", n.ttl, ip.String())
+
+	n.traceResult[n.ttl] = append(n.traceResult[n.ttl], ip)
+	if n.ttl == n.ttlMax && len(n.traceResult[n.ttl]) >= n.ttlRepeatMax {
+		n.Stop() // finished!
+	}
 }
 
 // This function takes a gopacket.Packet and a TTL
 // and returns a byte array of the serialized packet with the specified TTL
-// XXX fixme: make me work with IPv6!
 func serializeWithTTL(p gopacket.Packet, ttl uint8) []byte {
 	ipLayer := p.Layer(layers.LayerTypeIPv4)
 	if ipLayer == nil {
@@ -313,11 +406,9 @@ func getTCPFlowFromTCPHead(data []byte) gopacket.Flow {
 func getPacketFlow(packet []byte) flowKey {
 	var ip layers.IPv4
 	var tcp layers.TCP
-
 	decoded := []gopacket.LayerType{}
 	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeIPv4, &ip, &tcp)
 	err := parser.DecodeLayers(packet, &decoded)
-
 	if err != nil {
 		// XXX last 64 bits... we only use the last 32 bits
 		tcpHead := packet[len(packet)-8 : len(packet)]
@@ -334,8 +425,14 @@ iptables -A OUTPUT -j NFQUEUE --queue-num 0 -p tcp --dport 2666
 
 ***/
 func main() {
-	o := NewNFQueueTraceObserver("wlan0", 3, 66)
+	options := NFQueueTraceObserverOptions{
+		iface:        "wlan0",
+		ttlMax:       40,
+		ttlRepeatMax: 3,
+		mangleFreq:   6,
+	}
+	o := NewNFQueueTraceObserver(options)
 	o.Start()
-	<-o.finished
 	// XXX
+	<-o.finished
 }
