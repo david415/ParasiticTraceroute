@@ -173,10 +173,7 @@ func (o *NFQueueTraceObserver) startReceivingReplies() {
 			}
 			typ := uint8(icmp.TypeCode >> 8)
 			if typ == layers.ICMPv4TypeTimeExceeded {
-				flow, err = getPacketFlow(payload)
-				if err != nil {
-					continue // ignore payloads we fail to parse
-				}
+				flow = getPacketFlow(payload)
 				if o.flowTracker.HasFlow(flow) == false {
 					// ignore ICMP ttl expire packets that are for flows other than the ones we are currently tracking
 					continue
@@ -279,51 +276,44 @@ func serializeWithTTL(p gopacket.Packet, ttl uint8) []byte {
 	return rawPacketBuf.Bytes()
 }
 
-// note: a "TCP Head" is the first 8 bytes of the TCP Header.
 // We use this to deal with rfc792 implementations where
 // the original packet is NOT sent back via ICMP payload but
-// instead 8 bytes of the original packet are sent.
+// instead 64 bits of the original packet are sent.
 // https://tools.ietf.org/html/rfc792
-// returns SrcPort, DstPort and Sequence number
-func getFlowFromTCPHead(data []byte) (layers.TCPPort, layers.TCPPort, uint32) {
+// Returns a TCP Flow.
+// XXX obviously the 64 bits could be from a UDP packet or something else
+// however this is *good-enough* for NFQueue TCP traceroute!
+// XXX should we look at the protocol specified in the IP header
+// and set it's type here? no we should probably not even get this
+// far if the IP header has something other than TCP specified...
+func getTCPFlowFromTCPHead(data []byte) gopacket.Flow {
 	var srcPort, dstPort layers.TCPPort
-	var seq uint32
 	srcPort = layers.TCPPort(binary.BigEndian.Uint16(data[0:2]))
 	dstPort = layers.TCPPort(binary.BigEndian.Uint16(data[2:4]))
-	seq = binary.BigEndian.Uint32(data[4:8])
-	return srcPort, dstPort, seq
+	// XXX convert to tcp/ip flow
+	tcpSrc := layers.NewTCPPortEndpoint(srcPort)
+	tcpDst := layers.NewTCPPortEndpoint(dstPort)
+	tcpFlow, _ := gopacket.FlowFromEndpoints(tcpSrc, tcpDst)
+	// error (^ _) is only non-nil if the two endpoint types don't match
+	return tcpFlow
 }
 
 // given a byte array packet return a tcp/ip flow
-func getPacketFlow(packet []byte) (flowKey, error) {
+func getPacketFlow(packet []byte) flowKey {
 	var ip layers.IPv4
 	var tcp layers.TCP
-	var flow flowKey
 
 	decoded := []gopacket.LayerType{}
 	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeIPv4, &ip, &tcp)
 	err := parser.DecodeLayers(packet, &decoded)
 
 	if err != nil {
+		// XXX last 64 bits... we only use the last 32 bits
 		tcpHead := packet[len(packet)-8 : len(packet)]
-		srcPort, dstPort, _ := getFlowFromTCPHead(tcpHead)
-
-		// XXX convert to tcp/ip flow
-		tcpSrc := layers.NewTCPPortEndpoint(srcPort)
-		tcpDst := layers.NewTCPPortEndpoint(dstPort)
-		tcpFlow, err := gopacket.FlowFromEndpoints(tcpSrc, tcpDst)
-
-		if err != nil {
-			// we should never hit this condition
-			// because it only happens if the two endpoints
-			// are of mismatched type
-			return flow, err
-		} else {
-			return flowKey{ip.NetworkFlow(), tcpFlow}, nil
-		}
+		tcpFlow := getTCPFlowFromTCPHead(tcpHead)
+		return flowKey{ip.NetworkFlow(), tcpFlow}
 	}
-	flow = flowKey{ip.NetworkFlow(), tcp.TransportFlow()}
-	return flow, nil
+	return flowKey{ip.NetworkFlow(), tcp.TransportFlow()}
 }
 
 /***
