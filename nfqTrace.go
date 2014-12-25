@@ -1,8 +1,11 @@
-/**
-agpl license goes here
+/*
+Parasitic forward/reverse Linux-Netfilter Queue traceroute
+for penetrating network address tranlation devices...
+tracing the client's internal network.
 
-author david stainton
-**/
+software license: MIT
+author: david stainton
+*/
 
 package main
 
@@ -17,6 +20,8 @@ import (
 	"sync"
 )
 
+// this is a composite struct type called "flowKey"
+// used to track tcp/ip flows... as a hashmap key.
 type flowKey [2]gopacket.Flow
 
 type FlowTracker struct {
@@ -173,7 +178,13 @@ func (o *NFQueueTraceObserver) startReceivingReplies() {
 			}
 			typ := uint8(icmp.TypeCode >> 8)
 			if typ == layers.ICMPv4TypeTimeExceeded {
+
+				// XXX todo: check that the IP header protocol value is set to TCP
+
 				flow = getPacketFlow(payload)
+
+				// XXX it feels dirty to have the mutex around the hashmap
+				// i'm thinking about using channels instead...
 				if o.flowTracker.HasFlow(flow) == false {
 					// ignore ICMP ttl expire packets that are for flows other than the ones we are currently tracking
 					continue
