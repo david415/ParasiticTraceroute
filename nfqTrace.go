@@ -1,11 +1,6 @@
 /*
- * nfqTrace.go - Forward/Reverse TCP traceroute using Linux NFQueue
+ * nfqTrace.go - Parasitic Forward/Reverse TCP traceroute using Linux Netfilter Queue
  * Copyright (c) 2014 David Anthony Stainton
- *
- * Abstract:
- * Parasitic forward/reverse Linux-Netfilter Queue traceroute
- * for penetrating network address translation devices...
- * tracing the client's internal network.
  *
  * The MIT License (MIT)
  * Copyright (c) 2014 David Anthony Stainton
@@ -40,6 +35,7 @@ import (
 	"github.com/david415/go-netfilter-queue"
 	"log"
 	"net"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -49,11 +45,12 @@ const (
 	MAX_TTL uint8 = 255
 )
 
-var iface = flag.String("i", "wlan0", "Interface to get packets from")
-var timeoutSeconds = flag.Int("t", 30, "Number of seconds to await a ICMP-TTL-expired response")
-var ttlMax = flag.Int("m", 30, "Maximum TTL that will be used in the traceroute")
-var ttlRepeatMax = flag.Int("r", 3, "Number of times each TTL should be sent")
-var mangleFreq = flag.Int("f", 6, "Number of packets that should traverse a flow before we mangle the TTL")
+var logFile = flag.String("log-file", "nfqtrace.log", "log file")
+var iface = flag.String("interface", "wlan0", "Interface to get packets from")
+var timeoutSeconds = flag.Int("timeout", 30, "Number of seconds to await a ICMP-TTL-expired response")
+var ttlMax = flag.Int("maxttl", 30, "Maximum TTL that will be used in the traceroute")
+var ttlRepeatMax = flag.Int("ttlrepeat", 3, "Number of times each TTL should be sent")
+var mangleFreq = flag.Int("packetfreq", 6, "Number of packets that should traverse a flow before we mangle the TTL")
 
 // this is a composite struct type called "flowKey"
 // used to track tcp/ip flows... as a hashmap key.
@@ -466,10 +463,12 @@ func getPacketFlow(packet []byte) flowKey {
 }
 
 /***
-use this rough POC with an iptables nfqueue rule that will select
-a tcp flow direction like this:
+to be used with an iptables nfqueue rule that will select
+a tcp flow like this:
 iptables -A OUTPUT -j NFQUEUE --queue-num 0 -p tcp --dport 2666
 
+or like this:
+iptables -A OUTPUT -j NFQUEUE --queue-num 0 -p tcp --sport 9000
 ***/
 func main() {
 
@@ -478,6 +477,12 @@ func main() {
 	if *ttlMax > int(MAX_TTL) {
 		panic("TTL is a uint8, maximum value is 255")
 	}
+
+	f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		log.Fatalf("Failed to create log file: %s\n", err)
+	}
+	log.SetOutput(f)
 
 	options := NFQueueTraceObserverOptions{
 		iface:          *iface,
@@ -489,7 +494,7 @@ func main() {
 	o := NewNFQueueTraceObserver(options)
 	o.Start()
 
-	// XXX
+	// XXX run forever or until someone hits control-c...
 	finished := make(chan bool)
 	<-finished
 }
