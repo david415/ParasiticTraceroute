@@ -50,6 +50,7 @@ const (
 )
 
 var iface = flag.String("i", "wlan0", "Interface to get packets from")
+var timeoutSeconds = flag.Int("t", 30, "Number of seconds to await a ICMP-TTL-expired response")
 var ttlMax = flag.Int("m", 30, "Maximum TTL that will be used in the traceroute")
 var ttlRepeatMax = flag.Int("r", 3, "Number of times each TTL should be sent")
 var mangleFreq = flag.Int("f", 6, "Number of packets that should traverse a flow before we mangle the TTL")
@@ -99,10 +100,11 @@ func (f *FlowTracker) GetFlowTrace(flow flowKey) *NFQueueTraceroute {
 
 type NFQueueTraceObserverOptions struct {
 	// network interface to listen for ICMP responses
-	iface        string
-	ttlMax       uint8
-	ttlRepeatMax int
-	mangleFreq   int
+	iface          string
+	ttlMax         uint8
+	ttlRepeatMax   int
+	mangleFreq     int
+	timeoutSeconds int
 }
 
 type NFQueueTraceObserver struct {
@@ -203,7 +205,7 @@ func (o *NFQueueTraceObserver) processPacket(p netfilter.NFPacket) {
 
 	flow := flowKey{ip.NetworkFlow(), tcp.TransportFlow()}
 	if o.flowTracker.HasFlow(flow) == false {
-		nfqTrace := NewNFQueueTraceroute(flow, o, o.options.ttlMax, o.options.ttlRepeatMax, o.options.mangleFreq)
+		nfqTrace := NewNFQueueTraceroute(flow, o, o.options.ttlMax, o.options.ttlRepeatMax, o.options.mangleFreq, o.options.timeoutSeconds)
 		o.flowTracker.AddFlow(flow, nfqTrace)
 	}
 	nfqTrace := o.flowTracker.GetFlowTrace(flow)
@@ -270,12 +272,14 @@ type NFQueueTraceroute struct {
 
 	observer *NFQueueTraceObserver
 
-	ttl          uint8
-	ttlMax       uint8
-	ttlRepeat    int
-	ttlRepeatMax int
-	mangleFreq   int
-	count        int
+	ttlMax         uint8
+	ttlRepeatMax   int
+	mangleFreq     int
+	timeoutSeconds int
+
+	ttlRepeat int
+	ttl       uint8
+	count     int
 
 	// ip.TTL -> list of ip addrs
 	traceResult map[uint8][]net.IP
@@ -295,7 +299,7 @@ type NFQueueTraceroute struct {
 // - send each TTL out ttlRepeatMax number of times.
 // - only mangle a packet's TTL after mangleFreq number
 // of packets have traversed the flow
-func NewNFQueueTraceroute(id flowKey, observer *NFQueueTraceObserver, ttlMax uint8, ttlRepeatMax, mangleFreq int) *NFQueueTraceroute {
+func NewNFQueueTraceroute(id flowKey, observer *NFQueueTraceObserver, ttlMax uint8, ttlRepeatMax, mangleFreq, timeoutSeconds int) *NFQueueTraceroute {
 	nfqTrace := NFQueueTraceroute{
 		id:                  id,
 		observer:            observer,
@@ -307,6 +311,7 @@ func NewNFQueueTraceroute(id flowKey, observer *NFQueueTraceObserver, ttlMax uin
 		count:               1,
 		traceResult:         make(map[uint8][]net.IP, 1),
 		stopped:             false,
+		timeoutSeconds:      timeoutSeconds,
 		responseTimedOut:    false,
 		stopTimerChannel:    make(chan bool),
 		restartTimerChannel: make(chan bool),
@@ -320,7 +325,7 @@ func (n *NFQueueTraceroute) StartResponseTimer() {
 	go func() {
 		for {
 			select {
-			case <-time.After(time.Duration(200) * time.Second):
+			case <-time.After(time.Duration(n.timeoutSeconds) * time.Second):
 
 				if n.ttl >= n.ttlMax && n.ttlRepeat >= n.ttlRepeatMax {
 					n.Stop()
@@ -475,10 +480,11 @@ func main() {
 	}
 
 	options := NFQueueTraceObserverOptions{
-		iface:        *iface,
-		ttlMax:       uint8(*ttlMax),
-		ttlRepeatMax: *ttlRepeatMax,
-		mangleFreq:   *mangleFreq,
+		iface:          *iface,
+		timeoutSeconds: *timeoutSeconds,
+		ttlMax:         uint8(*ttlMax),
+		ttlRepeatMax:   *ttlRepeatMax,
+		mangleFreq:     *mangleFreq,
 	}
 	o := NewNFQueueTraceObserver(options)
 	o.Start()
