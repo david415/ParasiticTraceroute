@@ -154,20 +154,17 @@ func (o *NFQueueTraceObserver) Stop() {
 	o.done <- true
 }
 
+// log trace results
 func (o *NFQueueTraceObserver) receiveTraceResult(traceID flowKey, traceResult map[uint8][]net.IP) {
-	log.Print("receiveTraceResult waiting for lock\n")
 	o.addResultMutex.Lock()
-	log.Print("receiveTraceResult acquired lock... and now unlocking\n")
 
-	// XXX todo: print flow
 	ipFlow := traceID[0]
 	tcpFlow := traceID[1]
 	srcIP, dstIP := ipFlow.Endpoints()
 	srcPort, dstPort := tcpFlow.Endpoints()
-	log.Printf("trace of flow id %s:%s -> %s:%s\n", srcIP, srcPort.String(), dstIP, dstPort.String())
+	log.Printf("start of trace: flow id %s:%s -> %s:%s\n", srcIP, srcPort.String(), dstIP, dstPort.String())
 
-	// XXX sort results
-
+	// XXX sort result TTLs
 	var keys []int
 	nfqTrace := o.flowTracker.GetFlowTrace(traceID)
 	for k := range nfqTrace.traceResult {
@@ -175,7 +172,6 @@ func (o *NFQueueTraceObserver) receiveTraceResult(traceID flowKey, traceResult m
 	}
 	sort.Ints(keys)
 
-	// To perform the opertion you want
 	for _, k := range keys {
 		log.Printf("ttl: %d\n", k)
 		for _, ip := range nfqTrace.traceResult[uint8(k)] {
@@ -183,7 +179,8 @@ func (o *NFQueueTraceObserver) receiveTraceResult(traceID flowKey, traceResult m
 		}
 	}
 
-	// XXX todo: sort and print the tracemap
+	log.Printf("end of trace: flow id %s:%s -> %s:%s\n", srcIP, srcPort.String(), dstIP, dstPort.String())
+
 	o.addResultMutex.Unlock()
 }
 
@@ -293,7 +290,6 @@ type NFQueueTraceroute struct {
 // - only mangle a packet's TTL after mangleFreq number
 // of packets have traversed the flow
 func NewNFQueueTraceroute(id flowKey, observer *NFQueueTraceObserver, ttlMax uint8, ttlRepeatMax, mangleFreq int) *NFQueueTraceroute {
-	log.Print("NewNFQueueTraceroute\n")
 	nfqTrace := NFQueueTraceroute{
 		id:                  id,
 		observer:            observer,
@@ -314,13 +310,11 @@ func NewNFQueueTraceroute(id flowKey, observer *NFQueueTraceObserver, ttlMax uin
 }
 
 func (n *NFQueueTraceroute) StartResponseTimer() {
-	log.Print("StartResponseTimer\n")
 
 	go func() {
 		for {
 			select {
 			case <-time.After(time.Duration(200) * time.Second):
-				log.Print("TimerExpired\n")
 
 				if n.ttl >= n.ttlMax && n.ttlRepeat >= n.ttlRepeatMax {
 					n.Stop()
@@ -329,10 +323,8 @@ func (n *NFQueueTraceroute) StartResponseTimer() {
 
 				n.responseTimedOut = true
 			case <-n.restartTimerChannel:
-				log.Print("restartTimerChannel fired\n")
 				continue
 			case <-n.stopTimerChannel:
-				log.Print("stopTimerChannel fired\n")
 				return
 			}
 		}
@@ -340,12 +332,10 @@ func (n *NFQueueTraceroute) StartResponseTimer() {
 }
 
 func (n *NFQueueTraceroute) submitResult() {
-	log.Print("submitResult\n")
 	n.observer.receiveTraceResult(n.id, n.traceResult)
 }
 
 func (n *NFQueueTraceroute) Stop() {
-	log.Print("NFQueueTraceroute.Stop()\n")
 	n.stopped = true
 	n.stopTimerChannel <- true
 	close(n.stopTimerChannel)
@@ -363,8 +353,6 @@ func (n *NFQueueTraceroute) processPacket(p netfilter.NFPacket) {
 	}
 
 	if n.count%n.mangleFreq == 0 {
-		log.Printf("processPacket mangle case n.ttl %d, n.ttlRepeat %d, n.ttlRepeatMax %d\n", n.ttl, n.ttlRepeat, n.ttlRepeatMax)
-
 		n.ttlRepeat += 1
 
 		if n.responseTimedOut {
@@ -373,7 +361,6 @@ func (n *NFQueueTraceroute) processPacket(p netfilter.NFPacket) {
 			n.responseTimedOut = false
 			n.restartTimerChannel <- true
 		} else if n.ttlRepeat == n.ttlRepeatMax {
-			log.Print("ttlRepeatMax reached case\n")
 			n.ttl += 1
 			n.ttlRepeat = 0
 			n.responseTimedOut = false
@@ -397,8 +384,6 @@ func (n *NFQueueTraceroute) processPacket(p netfilter.NFPacket) {
 // XXX
 // store the "reply" source ip address (icmp ttl expired packet with payload matching this flow)
 func (n *NFQueueTraceroute) replyReceived(ip net.IP) {
-	log.Printf("replyReceived: ttl %d ip %s\n", n.ttl, ip.String())
-
 	n.traceResult[n.ttl] = append(n.traceResult[n.ttl], ip)
 	if n.ttl == n.ttlMax && len(n.traceResult[n.ttl]) >= n.ttlRepeatMax {
 		n.Stop() // finished!
