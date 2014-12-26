@@ -36,6 +36,7 @@ import (
 	"code.google.com/p/gopacket/layers"
 	"code.google.com/p/gopacket/pcap"
 	"encoding/binary"
+	"flag"
 	"github.com/david415/go-netfilter-queue"
 	"log"
 	"net"
@@ -47,6 +48,11 @@ import (
 const (
 	MAX_TTL uint8 = 255
 )
+
+var iface = flag.String("i", "wlan0", "Interface to get packets from")
+var ttlMax = flag.Int("m", 30, "Maximum TTL that will be used in the traceroute")
+var ttlRepeatMax = flag.Int("r", 3, "Number of times each TTL should be sent")
+var mangleFreq = flag.Int("f", 6, "Number of packets that should traverse a flow before we mangle the TTL")
 
 // this is a composite struct type called "flowKey"
 // used to track tcp/ip flows... as a hashmap key.
@@ -461,11 +467,18 @@ iptables -A OUTPUT -j NFQUEUE --queue-num 0 -p tcp --dport 2666
 
 ***/
 func main() {
+
+	flag.Parse()
+
+	if *ttlMax > int(MAX_TTL) {
+		panic("TTL is a uint8, maximum value is 255")
+	}
+
 	options := NFQueueTraceObserverOptions{
-		iface:        "wlan0",
-		ttlMax:       10,
-		ttlRepeatMax: 3,
-		mangleFreq:   6,
+		iface:        *iface,
+		ttlMax:       uint8(*ttlMax),
+		ttlRepeatMax: *ttlRepeatMax,
+		mangleFreq:   *mangleFreq,
 	}
 	o := NewNFQueueTraceObserver(options)
 	o.Start()
