@@ -39,6 +39,7 @@ import (
 	"github.com/david415/go-netfilter-queue"
 	"log"
 	"net"
+	"sort"
 	"sync"
 	"time"
 )
@@ -111,17 +112,14 @@ type NFQueueTraceObserver struct {
 	// this is used to stop all the traceroutes
 	done chan bool
 
-	// signal our calling party that we are finished
-	// XXX get rid of this?
-	finished chan bool
+	addResultMutex sync.Mutex
 }
 
 func NewNFQueueTraceObserver(options NFQueueTraceObserverOptions) *NFQueueTraceObserver {
 	var err error
 	o := NFQueueTraceObserver{
-		options:  options,
-		done:     make(chan bool),
-		finished: make(chan bool),
+		options: options,
+		done:    make(chan bool),
 	}
 
 	flowTracker := NewFlowTracker()
@@ -156,6 +154,39 @@ func (o *NFQueueTraceObserver) Stop() {
 	o.done <- true
 }
 
+func (o *NFQueueTraceObserver) receiveTraceResult(traceID flowKey, traceResult map[uint8][]net.IP) {
+	log.Print("receiveTraceResult waiting for lock\n")
+	o.addResultMutex.Lock()
+	log.Print("receiveTraceResult acquired lock... and now unlocking\n")
+
+	// XXX todo: print flow
+	ipFlow := traceID[0]
+	tcpFlow := traceID[1]
+	srcIP, dstIP := ipFlow.Endpoints()
+	srcPort, dstPort := tcpFlow.Endpoints()
+	log.Printf("trace of flow id %s:%s -> %s:%s\n", srcIP, srcPort.String(), dstIP, dstPort.String())
+
+	// XXX sort results
+
+	var keys []int
+	nfqTrace := o.flowTracker.GetFlowTrace(traceID)
+	for k := range nfqTrace.traceResult {
+		keys = append(keys, int(k))
+	}
+	sort.Ints(keys)
+
+	// To perform the opertion you want
+	for _, k := range keys {
+		log.Printf("ttl: %d\n", k)
+		for _, ip := range nfqTrace.traceResult[uint8(k)] {
+			log.Printf("ip %s\n", ip.String())
+		}
+	}
+
+	// XXX todo: sort and print the tracemap
+	o.addResultMutex.Unlock()
+}
+
 // XXX make the locking more efficient?
 func (o *NFQueueTraceObserver) processPacket(p netfilter.NFPacket) {
 	ipLayer := p.Packet.Layer(layers.LayerTypeIPv4)
@@ -169,7 +200,7 @@ func (o *NFQueueTraceObserver) processPacket(p netfilter.NFPacket) {
 
 	flow := flowKey{ip.NetworkFlow(), tcp.TransportFlow()}
 	if o.flowTracker.HasFlow(flow) == false {
-		nfqTrace := NewNFQueueTraceroute(o.options.ttlMax, o.options.ttlRepeatMax, o.options.mangleFreq)
+		nfqTrace := NewNFQueueTraceroute(flow, o, o.options.ttlMax, o.options.ttlRepeatMax, o.options.mangleFreq)
 		o.flowTracker.AddFlow(flow, nfqTrace)
 	}
 	nfqTrace := o.flowTracker.GetFlowTrace(flow)
@@ -232,6 +263,10 @@ func (o *NFQueueTraceObserver) startReceivingReplies() {
 }
 
 type NFQueueTraceroute struct {
+	id flowKey
+
+	observer *NFQueueTraceObserver
+
 	ttl          uint8
 	ttlMax       uint8
 	ttlRepeat    int
@@ -257,9 +292,11 @@ type NFQueueTraceroute struct {
 // - send each TTL out ttlRepeatMax number of times.
 // - only mangle a packet's TTL after mangleFreq number
 // of packets have traversed the flow
-func NewNFQueueTraceroute(ttlMax uint8, ttlRepeatMax, mangleFreq int) *NFQueueTraceroute {
+func NewNFQueueTraceroute(id flowKey, observer *NFQueueTraceObserver, ttlMax uint8, ttlRepeatMax, mangleFreq int) *NFQueueTraceroute {
 	log.Print("NewNFQueueTraceroute\n")
 	nfqTrace := NFQueueTraceroute{
+		id:                  id,
+		observer:            observer,
 		ttl:                 1,
 		ttlMax:              ttlMax,
 		ttlRepeat:           1,
@@ -302,13 +339,18 @@ func (n *NFQueueTraceroute) StartResponseTimer() {
 	}()
 }
 
+func (n *NFQueueTraceroute) submitResult() {
+	log.Print("submitResult\n")
+	n.observer.receiveTraceResult(n.id, n.traceResult)
+}
+
 func (n *NFQueueTraceroute) Stop() {
 	log.Print("NFQueueTraceroute.Stop()\n")
 	n.stopped = true
 	n.stopTimerChannel <- true
 	close(n.stopTimerChannel)
 	close(n.restartTimerChannel)
-
+	n.submitResult()
 }
 
 // given a packet we decided weather or not to mangle the TTL
@@ -436,12 +478,14 @@ iptables -A OUTPUT -j NFQUEUE --queue-num 0 -p tcp --dport 2666
 func main() {
 	options := NFQueueTraceObserverOptions{
 		iface:        "wlan0",
-		ttlMax:       40,
+		ttlMax:       10,
 		ttlRepeatMax: 3,
 		mangleFreq:   6,
 	}
 	o := NewNFQueueTraceObserver(options)
 	o.Start()
+
 	// XXX
-	<-o.finished
+	finished := make(chan bool)
+	<-finished
 }
