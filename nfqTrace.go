@@ -45,6 +45,8 @@ const (
 	MAX_TTL uint8 = 255
 )
 
+var queueId = flag.Int("queue-id", 0, "NFQueue ID number")
+var queueSize = flag.Int("queue-size", 10000, "Maximum capacity of the NFQueue")
 var logFile = flag.String("log-file", "nfqtrace.log", "log file")
 var iface = flag.String("interface", "wlan0", "Interface to get packets from")
 var timeoutSeconds = flag.Int("timeout", 30, "Number of seconds to await a ICMP-TTL-expired response")
@@ -97,9 +99,14 @@ func (f *FlowTracker) GetFlowTrace(flow flowKey) *NFQueueTraceroute {
 
 type NFQueueTraceObserverOptions struct {
 	// network interface to listen for ICMP responses
-	iface          string
-	ttlMax         uint8
-	ttlRepeatMax   int
+	queueId   int
+	queueSize int
+
+	iface string
+
+	ttlMax       uint8
+	ttlRepeatMax int
+
 	mangleFreq     int
 	timeoutSeconds int
 }
@@ -130,7 +137,7 @@ func NewNFQueueTraceObserver(options NFQueueTraceObserverOptions) *NFQueueTraceO
 	flowTracker := NewFlowTracker()
 	o.flowTracker = flowTracker
 	// XXX adjust these parameters
-	o.nfq, err = netfilter.NewNFQueue(0, 100, netfilter.NF_DEFAULT_PACKET_SIZE)
+	o.nfq, err = netfilter.NewNFQueue(uint16(o.options.queueId), uint32(o.options.queueSize), netfilter.NF_DEFAULT_PACKET_SIZE)
 	if err != nil {
 		panic(err)
 	}
@@ -485,6 +492,8 @@ func main() {
 	log.SetOutput(f)
 
 	options := NFQueueTraceObserverOptions{
+		queueId:        *queueId,
+		queueSize:      *queueSize,
 		iface:          *iface,
 		timeoutSeconds: *timeoutSeconds,
 		ttlMax:         uint8(*ttlMax),
