@@ -72,28 +72,28 @@ func NewFlowTracker() *FlowTracker {
 }
 
 func (f *FlowTracker) HasFlow(flow flowKey) bool {
+	defer f.lock.RUnlock()
 	f.lock.RLock()
 	_, ok := f.flowMap[flow]
-	f.lock.RUnlock()
 	return ok
 }
 
 func (f *FlowTracker) AddFlow(flow flowKey, nfqTrace *NFQueueTraceroute) {
+	defer f.lock.Unlock()
 	f.lock.Lock()
 	f.flowMap[flow] = nfqTrace
-	f.lock.Unlock()
 }
 
 func (f *FlowTracker) Delete(flow flowKey) {
+	defer f.lock.Unlock()
 	f.lock.Lock()
 	delete(f.flowMap, flow)
-	f.lock.Unlock()
 }
 
 func (f *FlowTracker) GetFlowTrace(flow flowKey) *NFQueueTraceroute {
+	defer f.lock.RUnlock()
 	f.lock.RLock()
 	ret := f.flowMap[flow]
-	f.lock.RUnlock()
 	return ret
 }
 
@@ -370,12 +370,7 @@ func (n *NFQueueTraceroute) processPacket(p netfilter.NFPacket) {
 	if n.count%n.mangleFreq == 0 {
 		n.ttlRepeat += 1
 
-		if n.responseTimedOut {
-			n.ttl += 1
-			n.ttlRepeat = 0
-			n.responseTimedOut = false
-			n.restartTimerChannel <- true
-		} else if n.ttlRepeat == n.ttlRepeatMax {
+		if n.responseTimedOut || n.ttlRepeat == n.ttlRepeatMax {
 			n.ttl += 1
 			n.ttlRepeat = 0
 			n.responseTimedOut = false
