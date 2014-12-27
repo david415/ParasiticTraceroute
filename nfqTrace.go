@@ -266,7 +266,7 @@ type HopTick struct {
 }
 
 func (t *HopTick) String() string {
-	return fmt.Sprintf("%s %s\n", t.instant.String(), t.ip.String())
+	return fmt.Sprintf("%s %s\n", t.ip.String(), t.instant.String())
 }
 
 // TCPResult uses a hashmap to relate route hope TTLs to TraceTick structs
@@ -369,7 +369,7 @@ func (n *NFQueueTraceroute) StartResponseTimer() {
 		for {
 			select {
 			case <-time.After(time.Duration(n.timeoutSeconds) * time.Second):
-
+				log.Printf("timeout fired - ttl %d\n", n.ttl)
 				if n.ttl >= n.ttlMax && n.ttlRepeat >= n.ttlRepeatMax {
 					n.Stop()
 					return
@@ -377,8 +377,10 @@ func (n *NFQueueTraceroute) StartResponseTimer() {
 
 				n.responseTimedOut = true
 			case <-n.restartTimerChannel:
+				log.Print("restart timer\n")
 				continue
 			case <-n.stopTimerChannel:
+				log.Print("stop timer\n")
 				return
 			}
 		}
@@ -390,6 +392,7 @@ func (n *NFQueueTraceroute) submitResult() {
 }
 
 func (n *NFQueueTraceroute) Stop() {
+	log.Print("stop traceroute\n")
 	n.stopped = true
 	n.stopTimerChannel <- true
 	close(n.stopTimerChannel)
@@ -406,24 +409,29 @@ func (n *NFQueueTraceroute) processPacket(p netfilter.NFPacket) {
 		return
 	}
 
-	if n.count%n.mangleFreq == 0 {
-		n.ttlRepeat += 1
-
-		if n.responseTimedOut || n.ttlRepeat == n.ttlRepeatMax {
-			n.ttl += 1
-			n.ttlRepeat = 0
-			n.responseTimedOut = false
-			n.restartTimerChannel <- true
-		}
-
-		// terminate trace upon max ttl and ttlRepeatMax conditions
-		if n.ttl > n.ttlMax && n.ttlRepeat == (n.ttlRepeatMax-1) {
+	if n.ttl > n.ttlMax {
+		if n.responseTimedOut {
 			n.Stop()
 			p.SetVerdict(netfilter.NF_ACCEPT)
 			return
 		}
+	}
 
-		p.SetModifiedVerdict(netfilter.NF_REPEAT, serializeWithTTL(p.Packet, n.ttl))
+	if n.count%n.mangleFreq == 0 {
+		if n.ttlRepeat == n.ttlRepeatMax {
+			if n.responseTimedOut {
+				n.ttl += 1
+				n.ttlRepeat = 0
+				n.responseTimedOut = false
+				n.restartTimerChannel <- true
+			}
+		}
+		if n.ttlRepeat < n.ttlRepeatMax {
+			p.SetModifiedVerdict(netfilter.NF_REPEAT, serializeWithTTL(p.Packet, n.ttl))
+			n.ttlRepeat += 1
+		} else {
+			p.SetVerdict(netfilter.NF_ACCEPT)
+		}
 	} else {
 		p.SetVerdict(netfilter.NF_ACCEPT)
 	}
@@ -433,10 +441,13 @@ func (n *NFQueueTraceroute) processPacket(p netfilter.NFPacket) {
 // XXX
 // store the "reply" source ip address (icmp ttl expired packet with payload matching this flow)
 func (n *NFQueueTraceroute) replyReceived(ip net.IP) {
-	n.tcpRoute.AddHopTick(n.ttl, HopTick{
+
+	hoptick := HopTick{
 		ip:      ip,
 		instant: time.Now(),
-	})
+	}
+	n.tcpRoute.AddHopTick(n.ttl, hoptick)
+	fmt.Printf("TTL %d HopTick %s\n", n.ttl, hoptick.String())
 
 	if n.ttl == n.ttlMax && (n.tcpRoute.GetRepeatLength(n.ttl) >= n.ttlRepeatMax || n.responseTimedOut) {
 		n.Stop() // finished!
