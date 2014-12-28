@@ -60,16 +60,70 @@ var mangleFreq = flag.Int("packetfreq", 6, "Number of packets that should traver
 // used to track tcp/ip flows... as a hashmap key.
 type flowKey [2]gopacket.Flow
 
+// this is directional... it matches a specific TCP flow direction.
+type TcpFlowKey struct {
+	flow [2]gopacket.Flow
+}
+
+func NewTcpFlowKey(ipFlow gopacket.Flow, tcpFlow gopacket.Flow) TcpFlowKey {
+	return TcpFlowKey{
+		flow: [2]gopacket.Flow{
+			ipFlow,
+			tcpFlow,
+		},
+	}
+}
+
+// bidirectional in this case means that each of these keys
+// for each TCP connection can be represented by two TcpFlowKey`s
+type TcpBidirectionalFlowKey struct {
+	flow flowKey
+}
+
+func NewTcpBidirectionalFlowKey(ip layers.IPv4, tcp layers.TCP) TcpBidirectionalFlowKey {
+	var tcpSrc gopacket.Endpoint
+	var tcpDst gopacket.Endpoint
+
+	//XXX todo: avoid converting to string for sorting!
+	IPstr := []string{ip.SrcIP.String(), ip.DstIP.String()}
+	sort.Strings(IPstr)
+	srcIP := net.ParseIP(IPstr[0])
+	dstIP := net.ParseIP(IPstr[1])
+	ipSrcEnd := layers.NewIPEndpoint(srcIP)
+	ipDstEnd := layers.NewIPEndpoint(dstIP)
+	ipFlow, _ := gopacket.FlowFromEndpoints(ipSrcEnd, ipDstEnd)
+
+	if tcp.SrcPort >= tcp.DstPort {
+		tcpSrc = layers.NewTCPPortEndpoint(tcp.SrcPort)
+		tcpDst = layers.NewTCPPortEndpoint(tcp.DstPort)
+	} else {
+		tcpSrc = layers.NewTCPPortEndpoint(tcp.DstPort)
+		tcpDst = layers.NewTCPPortEndpoint(tcp.SrcPort)
+	}
+	tcpFlow, _ := gopacket.FlowFromEndpoints(tcpSrc, tcpDst)
+
+	return TcpBidirectionalFlowKey{
+		flow: flowKey{ipFlow, tcpFlow},
+	}
+}
+
+// XXX probably not useful
+func (f *TcpBidirectionalFlowKey) Get() flowKey {
+	return f.flow
+}
+
 // concurrent-safe hashmap of tcp/ip-flowKeys to NFQueueTraceroute`s
 type FlowTracker struct {
-	lock    *sync.RWMutex
-	flowMap map[flowKey]*NFQueueTraceroute
+	lock          *sync.RWMutex
+	flowMap       map[flowKey]*NFQueueTraceroute
+	connectionMap map[TcpBidirectionalFlowKey]*NFQueueTraceroute
 }
 
 func NewFlowTracker() *FlowTracker {
 	return &FlowTracker{
-		lock:    new(sync.RWMutex),
-		flowMap: make(map[flowKey]*NFQueueTraceroute),
+		lock:          new(sync.RWMutex),
+		flowMap:       make(map[flowKey]*NFQueueTraceroute),
+		connectionMap: make(map[TcpBidirectionalFlowKey]*NFQueueTraceroute),
 	}
 }
 
@@ -80,10 +134,24 @@ func (f *FlowTracker) HasFlow(flow flowKey) bool {
 	return ok
 }
 
-func (f *FlowTracker) AddFlow(flow flowKey, nfqTrace *NFQueueTraceroute) {
+func (f *FlowTracker) HasConnection(biflow TcpBidirectionalFlowKey) bool {
+	defer f.lock.RUnlock()
+	f.lock.RLock()
+	_, ok := f.connectionMap[biflow]
+	return ok
+}
+
+func (f *FlowTracker) GetConnectionTrace(flow TcpBidirectionalFlowKey) *NFQueueTraceroute {
+	return f.connectionMap[flow]
+}
+
+//XXX needs some cleanup
+func (f *FlowTracker) AddFlow(ip layers.IPv4, tcp layers.TCP, nfqTrace *NFQueueTraceroute) {
 	defer f.lock.Unlock()
 	f.lock.Lock()
+	flow := flowKey{ip.NetworkFlow(), tcp.TransportFlow()}
 	f.flowMap[flow] = nfqTrace
+	f.connectionMap[NewTcpBidirectionalFlowKey(ip, tcp)] = nfqTrace
 }
 
 func (f *FlowTracker) Delete(flow flowKey) {
@@ -116,9 +184,9 @@ type NFQueueTraceObserverOptions struct {
 type NFQueueTraceObserver struct {
 	// passed in from the user in our constructor...
 	options NFQueueTraceObserverOptions
+	nfq     *netfilter.NFQueue
 
 	flowTracker *FlowTracker
-	nfq         *netfilter.NFQueue
 
 	// packet channel for interacting with NFQueue
 	packets <-chan netfilter.NFPacket
@@ -136,8 +204,7 @@ func NewNFQueueTraceObserver(options NFQueueTraceObserverOptions) *NFQueueTraceO
 		done:    make(chan bool),
 	}
 
-	flowTracker := NewFlowTracker()
-	o.flowTracker = flowTracker
+	o.flowTracker = NewFlowTracker()
 	// XXX adjust these parameters
 	o.nfq, err = netfilter.NewNFQueue(uint16(o.options.queueId), uint32(o.options.queueSize), netfilter.NF_DEFAULT_PACKET_SIZE)
 	if err != nil {
@@ -148,6 +215,7 @@ func NewNFQueueTraceObserver(options NFQueueTraceObserverOptions) *NFQueueTraceO
 }
 
 func (o *NFQueueTraceObserver) Start() {
+	log.Print("NFQueueTraceObserver Start\n")
 	o.startReceivingReplies()
 	go func() {
 		for true {
@@ -165,6 +233,7 @@ func (o *NFQueueTraceObserver) Start() {
 }
 
 func (o *NFQueueTraceObserver) Stop() {
+	log.Print("NFQueueTraceObserver Stop\n")
 	o.done <- true
 }
 
@@ -198,21 +267,24 @@ func (o *NFQueueTraceObserver) processPacket(p netfilter.NFPacket) {
 	flow := flowKey{ip.NetworkFlow(), tcp.TransportFlow()}
 	if o.flowTracker.HasFlow(flow) == false {
 		nfqTrace := NewNFQueueTraceroute(flow, o, o.options.ttlMax, o.options.ttlRepeatMax, o.options.mangleFreq, o.options.timeoutSeconds)
-		o.flowTracker.AddFlow(flow, nfqTrace)
+		o.flowTracker.AddFlow(*ip, *tcp, nfqTrace)
 	}
 	nfqTrace := o.flowTracker.GetFlowTrace(flow)
 	nfqTrace.processPacket(p)
 }
 
-// return a net.IP channel to report all the ICMP reponse SrcIP addresses
-// that have the ICMP time exceeded flag set
 func (o *NFQueueTraceObserver) startReceivingReplies() {
+	log.Print("startReceivingReplies\n")
 	snaplen := 65536
-	filter := "icmp" // the idea here is to capture only ICMP packets
+	filter := "icmp or tcp"
 
 	var eth layers.Ethernet
 	var ip layers.IPv4
 	var icmp layers.ICMPv4
+
+	var eth2 layers.Ethernet
+	var ip2 layers.IPv4
+	var tcp layers.TCP
 	var payload gopacket.Payload
 	var flow flowKey
 
@@ -226,37 +298,49 @@ func (o *NFQueueTraceObserver) startReceivingReplies() {
 		log.Fatal("error setting BPF filter: ", err)
 	}
 
-	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip, &icmp, &payload)
+	icmpParser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip, &icmp, &payload)
+	tcpParser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth2, &ip2, &tcp)
 
 	go func() {
-		for true {
+		for {
 			data, _, err := handle.ReadPacketData()
 			if err != nil {
 				continue
 			}
-			err = parser.DecodeLayers(data, &decoded)
-			if err != nil {
+			err = tcpParser.DecodeLayers(data, &decoded)
+			if err == nil {
+				o.receiveTcp(ip2, tcp)
 				continue
 			}
-			typ := uint8(icmp.TypeCode >> 8)
-			if typ != layers.ICMPv4TypeTimeExceeded {
-				continue
+			err = icmpParser.DecodeLayers(data, &decoded)
+			if err == nil {
+				log.Print("icmp packet received\n")
+				typ := uint8(icmp.TypeCode >> 8)
+				if typ != layers.ICMPv4TypeTimeExceeded {
+					continue
+				}
+				// XXX todo: check that the IP header protocol value is set to TCP
+				flow = getPacketFlow(payload)
+				if o.flowTracker.HasFlow(flow) == false {
+					// ignore ICMP ttl expire packets that are for flows other than the ones we are currently tracking
+					continue
+				}
+				nfqTrace := o.flowTracker.GetFlowTrace(flow)
+				nfqTrace.replyReceived(ip.SrcIP)
 			}
-
-			// XXX todo: check that the IP header protocol value is set to TCP
-			flow = getPacketFlow(payload)
-
-			// XXX it feels dirty to have the mutex around the hashmap
-			// i'm thinking about using channels instead...
-			if o.flowTracker.HasFlow(flow) == false {
-				// ignore ICMP ttl expire packets that are for flows other than the ones we are currently tracking
-				continue
-			}
-
-			nfqTrace := o.flowTracker.GetFlowTrace(flow)
-			nfqTrace.replyReceived(ip.SrcIP)
 		}
 	}()
+}
+
+func (o *NFQueueTraceObserver) receiveTcp(ip layers.IPv4, tcp layers.TCP) {
+	tcpBiFlowKey := NewTcpBidirectionalFlowKey(ip, tcp)
+	if o.flowTracker.HasConnection(tcpBiFlowKey) {
+		if tcp.FIN {
+			log.Print("receiveTcp FIN detected\n")
+			nfqTrace := o.flowTracker.GetConnectionTrace(tcpBiFlowKey)
+			nfqTrace.Stop()
+		}
+	}
 }
 
 // HopTick represents a single route hop at a particular instant
@@ -266,10 +350,10 @@ type HopTick struct {
 }
 
 func (t *HopTick) String() string {
-	return fmt.Sprintf("%s %s\n", t.ip.String(), t.instant.String())
+	return fmt.Sprintf("%s %s", t.ip.String(), t.instant.String())
 }
 
-// TCPResult uses a hashmap to relate route hope TTLs to TraceTick structs
+// TCPResult uses a hashmap to relate route hop TTLs to TraceTick structs
 // this can be used to identify route changes over time
 type TcpRoute struct {
 	// TTL is the key
@@ -306,6 +390,7 @@ func (r *TcpRoute) String() string {
 		buffer.WriteString(fmt.Sprintf("ttl: %d\n", k))
 		for _, hopTick := range r.routeMap[uint8(k)] {
 			buffer.WriteString(hopTick.String())
+			buffer.WriteString("\n")
 		}
 	}
 	return buffer.String()
@@ -374,10 +459,10 @@ func (n *NFQueueTraceroute) StartResponseTimer() {
 					n.Stop()
 					return
 				}
-
 				n.responseTimedOut = true
 			case <-n.restartTimerChannel:
 				log.Print("restart timer\n")
+				n.responseTimedOut = false
 				continue
 			case <-n.stopTimerChannel:
 				log.Print("stop timer\n")
@@ -388,7 +473,7 @@ func (n *NFQueueTraceroute) StartResponseTimer() {
 }
 
 func (n *NFQueueTraceroute) submitResult() {
-	n.observer.receiveTraceRoute(n.id, n.tcpRoute)
+	log.Print(n.observer.receiveTraceRoute(n.id, n.tcpRoute))
 }
 
 func (n *NFQueueTraceroute) Stop() {
