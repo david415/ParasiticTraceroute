@@ -222,9 +222,11 @@ func (o *NFQueueTraceObserver) startParsingReplies() {
 	decoded := make([]gopacket.LayerType, 0, 4)
 
 	o.startReceivingIcmp()
-	o.startReceivingTcp()
+	o.startWatchingForTcpClose()
 
 	go func() {
+		defer close(o.receiveIcmpChan)
+		defer close(o.receiveTcpChan)
 		for packet := range o.receiveParseChan {
 			err := tcpParser.DecodeLayers(packet, &decoded)
 			if err == nil {
@@ -248,6 +250,7 @@ func (o *NFQueueTraceObserver) startParsingReplies() {
 
 func (o *NFQueueTraceObserver) startReceivingIcmp() {
 	go func() {
+		// bundle is network protocol layer cake payload/icmp/ip
 		for bundle := range o.receiveIcmpChan {
 			log.Print("icmp packet received\n")
 			typ := uint8(bundle.icmp.TypeCode >> 8)
@@ -261,13 +264,14 @@ func (o *NFQueueTraceObserver) startReceivingIcmp() {
 				continue
 			}
 			nfqTrace := o.flowTracker.GetFlowTrace(flow)
-			//nfqTrace.replyChan <- bundle.ip.SrcIP
-			nfqTrace.replyReceived(bundle.ip.SrcIP)
+
+			nfqTrace.receiveReplyChan <- bundle.ip.SrcIP
+			//nfqTrace.replyReceived(bundle.ip.SrcIP)
 		}
 	}()
 }
 
-func (o *NFQueueTraceObserver) startReceivingTcp() {
+func (o *NFQueueTraceObserver) startWatchingForTcpClose() {
 	go func() {
 		for tcpIpLayer := range o.receiveTcpChan {
 			ip, tcp := tcpIpLayer.Layers()
@@ -355,10 +359,8 @@ type NFQueueTraceroute struct {
 	stopped          bool
 	responseTimedOut bool
 
-	// XXX should it be a pointer instead?
-	receivePacketChannel chan netfilter.NFPacket
+	receiveReplyChan chan net.IP
 
-	resumeTimerChannel  chan bool
 	stopTimerChannel    chan bool
 	restartTimerChannel chan bool
 }
@@ -382,10 +384,12 @@ func NewNFQueueTraceroute(id flowKey, repeatMode bool, observer *NFQueueTraceObs
 		stopped:             false,
 		timeoutSeconds:      timeoutSeconds,
 		responseTimedOut:    false,
+		receiveReplyChan:    make(chan net.IP),
 		stopTimerChannel:    make(chan bool),
 		restartTimerChannel: make(chan bool),
 	}
 	nfqTrace.StartResponseTimer()
+	nfqTrace.startReceivingReplies()
 	return &nfqTrace
 }
 
@@ -468,20 +472,21 @@ func (n *NFQueueTraceroute) processPacket(p netfilter.NFPacket) {
 	n.count = n.count + 1
 }
 
-// XXX
-// store the "reply" source ip address (icmp ttl expired packet with payload matching this flow)
-func (n *NFQueueTraceroute) replyReceived(ip net.IP) {
+func (n *NFQueueTraceroute) startReceivingReplies() {
+	go func() {
+		for replyIP := range n.receiveReplyChan {
+			hoptick := HopTick{
+				ip:      replyIP,
+				instant: time.Now(),
+			}
+			n.tcpRoute.AddHopTick(n.ttl, hoptick)
+			fmt.Printf("TTL %d HopTick %s\n", n.ttl, hoptick.String())
 
-	hoptick := HopTick{
-		ip:      ip,
-		instant: time.Now(),
-	}
-	n.tcpRoute.AddHopTick(n.ttl, hoptick)
-	fmt.Printf("TTL %d HopTick %s\n", n.ttl, hoptick.String())
-
-	if n.ttl == n.ttlMax && (n.tcpRoute.GetRepeatLength(n.ttl) >= n.ttlRepeatMax || n.responseTimedOut) {
-		n.Stop() // finished!
-	}
+			if n.ttl == n.ttlMax && (n.tcpRoute.GetRepeatLength(n.ttl) >= n.ttlRepeatMax || n.responseTimedOut) {
+				n.Stop() // finished!
+			}
+		}
+	}()
 }
 
 // This function takes a gopacket.Packet and a TTL
