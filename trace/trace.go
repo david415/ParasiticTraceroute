@@ -31,7 +31,6 @@ import (
 	"code.google.com/p/gopacket"
 	"code.google.com/p/gopacket/layers"
 	"code.google.com/p/gopacket/pcap"
-	"encoding/binary"
 	"fmt"
 	"github.com/david415/go-netfilter-queue"
 	"log"
@@ -44,6 +43,23 @@ import (
 const (
 	MAX_TTL uint8 = 255
 )
+
+// used as a channel type
+type TcpIpLayer struct {
+	ip  layers.IPv4
+	tcp layers.TCP
+}
+
+func (t *TcpIpLayer) Layers() (layers.IPv4, layers.TCP) {
+	return t.ip, t.tcp
+}
+
+// used as a channel type
+type PayloadIcmpIpLayer struct {
+	ip      layers.IPv4
+	icmp    layers.ICMPv4
+	payload gopacket.Payload
+}
 
 type NFQueueTraceObserverOptions struct {
 	// network interface to listen for ICMP responses
@@ -69,9 +85,13 @@ type NFQueueTraceObserver struct {
 
 	// packet channel for interacting with NFQueue
 	packets <-chan netfilter.NFPacket
-
 	// this is used to stop all the traceroutes
 	done chan bool
+
+	stopReceiveChan  chan bool
+	receiveParseChan chan []byte
+	receiveTcpChan   chan TcpIpLayer
+	receiveIcmpChan  chan PayloadIcmpIpLayer
 
 	addResultMutex sync.Mutex
 }
@@ -79,8 +99,12 @@ type NFQueueTraceObserver struct {
 func NewNFQueueTraceObserver(options NFQueueTraceObserverOptions) *NFQueueTraceObserver {
 	var err error
 	o := NFQueueTraceObserver{
-		options: options,
-		done:    make(chan bool),
+		options:          options,
+		done:             make(chan bool),
+		stopReceiveChan:  make(chan bool),
+		receiveParseChan: make(chan []byte),
+		receiveTcpChan:   make(chan TcpIpLayer),
+		receiveIcmpChan:  make(chan PayloadIcmpIpLayer),
 	}
 
 	o.flowTracker = NewFlowTracker()
@@ -157,18 +181,6 @@ func (o *NFQueueTraceObserver) startReceivingReplies() {
 	snaplen := 65536
 	filter := "icmp or tcp"
 
-	var eth layers.Ethernet
-	var ip layers.IPv4
-	var icmp layers.ICMPv4
-
-	var eth2 layers.Ethernet
-	var ip2 layers.IPv4
-	var tcp layers.TCP
-	var payload gopacket.Payload
-	var flow flowKey
-
-	decoded := make([]gopacket.LayerType, 0, 4)
-
 	handle, err := pcap.OpenLive(o.options.Iface, int32(snaplen), true, pcap.BlockForever)
 	if err != nil {
 		log.Fatal("error opening pcap handle: ", err)
@@ -177,49 +189,98 @@ func (o *NFQueueTraceObserver) startReceivingReplies() {
 		log.Fatal("error setting BPF filter: ", err)
 	}
 
-	icmpParser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip, &icmp, &payload)
-	tcpParser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth2, &ip2, &tcp)
+	o.startParsingReplies()
 
 	go func() {
 		for {
-			data, _, err := handle.ReadPacketData()
-			if err != nil {
-				continue
-			}
-			err = tcpParser.DecodeLayers(data, &decoded)
-			if err == nil {
-				o.receiveTcp(ip2, tcp)
-				continue
-			}
-			err = icmpParser.DecodeLayers(data, &decoded)
-			if err == nil {
-				log.Print("icmp packet received\n")
-				typ := uint8(icmp.TypeCode >> 8)
-				if typ != layers.ICMPv4TypeTimeExceeded {
+			select {
+			case <-o.stopReceiveChan:
+				return
+			default:
+				data, _, err := handle.ReadPacketData()
+				if err != nil {
 					continue
 				}
-				// XXX todo: check that the IP header protocol value is set to TCP
-				flow = getPacketFlow(payload)
-				if o.flowTracker.HasFlow(flow) == false {
-					// ignore ICMP ttl expire packets that are for flows other than the ones we are currently tracking
-					continue
-				}
-				nfqTrace := o.flowTracker.GetFlowTrace(flow)
-				nfqTrace.replyReceived(ip.SrcIP)
+				o.receiveParseChan <- data
 			}
 		}
 	}()
 }
 
-func (o *NFQueueTraceObserver) receiveTcp(ip layers.IPv4, tcp layers.TCP) {
-	tcpBiFlowKey := NewTcpBidirectionalFlowKey(ip, tcp)
-	if o.flowTracker.HasConnection(tcpBiFlowKey) {
-		if tcp.FIN {
-			log.Print("receiveTcp FIN detected\n")
-			nfqTrace := o.flowTracker.GetConnectionTrace(tcpBiFlowKey)
-			nfqTrace.Stop()
+func (o *NFQueueTraceObserver) startParsingReplies() {
+	var eth layers.Ethernet
+	var ip layers.IPv4
+	var icmp layers.ICMPv4
+
+	var eth2 layers.Ethernet
+	var ip2 layers.IPv4
+	var tcp layers.TCP
+	var payload gopacket.Payload
+
+	icmpParser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip, &icmp, &payload)
+	tcpParser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth2, &ip2, &tcp)
+	decoded := make([]gopacket.LayerType, 0, 4)
+
+	o.startReceivingIcmp()
+	o.startReceivingTcp()
+
+	go func() {
+		for packet := range o.receiveParseChan {
+			err := tcpParser.DecodeLayers(packet, &decoded)
+			if err == nil {
+				o.receiveTcpChan <- TcpIpLayer{
+					ip:  ip2,
+					tcp: tcp,
+				}
+				continue
+			}
+			err = icmpParser.DecodeLayers(packet, &decoded)
+			if err == nil {
+				o.receiveIcmpChan <- PayloadIcmpIpLayer{
+					ip:      ip,
+					icmp:    icmp,
+					payload: payload,
+				}
+			}
 		}
-	}
+	}()
+}
+
+func (o *NFQueueTraceObserver) startReceivingIcmp() {
+	go func() {
+		for bundle := range o.receiveIcmpChan {
+			log.Print("icmp packet received\n")
+			typ := uint8(bundle.icmp.TypeCode >> 8)
+			if typ != layers.ICMPv4TypeTimeExceeded {
+				continue
+			}
+			// XXX todo: check that the IP header protocol value is set to TCP
+			flow := getPacketFlow(bundle.payload)
+			if o.flowTracker.HasFlow(flow) == false {
+				// ignore ICMP ttl expire packets that are for flows other than the ones we are currently tracking
+				continue
+			}
+			nfqTrace := o.flowTracker.GetFlowTrace(flow)
+			//nfqTrace.replyChan <- bundle.ip.SrcIP
+			nfqTrace.replyReceived(bundle.ip.SrcIP)
+		}
+	}()
+}
+
+func (o *NFQueueTraceObserver) startReceivingTcp() {
+	go func() {
+		for tcpIpLayer := range o.receiveTcpChan {
+			ip, tcp := tcpIpLayer.Layers()
+			tcpBiFlowKey := NewTcpBidirectionalFlowKey(ip, tcp)
+			if o.flowTracker.HasConnection(tcpBiFlowKey) {
+				if tcp.FIN {
+					log.Print("receiveTcp FIN detected\n")
+					nfqTrace := o.flowTracker.GetConnectionTrace(tcpBiFlowKey)
+					nfqTrace.Stop()
+				}
+			}
+		}
+	}()
 }
 
 // HopTick represents a single route hop at a particular instant
@@ -447,42 +508,4 @@ func serializeWithTTL(p gopacket.Packet, ttl uint8) []byte {
 		return nil
 	}
 	return rawPacketBuf.Bytes()
-}
-
-// We use this to deal with rfc792 implementations where
-// the original packet is NOT sent back via ICMP payload but
-// instead 64 bits of the original packet are sent.
-// https://tools.ietf.org/html/rfc792
-// Returns a TCP Flow.
-// XXX obviously the 64 bits could be from a UDP packet or something else
-// however this is *good-enough* for NFQueue TCP traceroute!
-// XXX should we look at the protocol specified in the IP header
-// and set it's type here? no we should probably not even get this
-// far if the IP header has something other than TCP specified...
-func getTCPFlowFromTCPHead(data []byte) gopacket.Flow {
-	var srcPort, dstPort layers.TCPPort
-	srcPort = layers.TCPPort(binary.BigEndian.Uint16(data[0:2]))
-	dstPort = layers.TCPPort(binary.BigEndian.Uint16(data[2:4]))
-	// XXX convert to tcp/ip flow
-	tcpSrc := layers.NewTCPPortEndpoint(srcPort)
-	tcpDst := layers.NewTCPPortEndpoint(dstPort)
-	tcpFlow, _ := gopacket.FlowFromEndpoints(tcpSrc, tcpDst)
-	// error (^ _) is only non-nil if the two endpoint types don't match
-	return tcpFlow
-}
-
-// given a byte array packet return a tcp/ip flow
-func getPacketFlow(packet []byte) flowKey {
-	var ip layers.IPv4
-	var tcp layers.TCP
-	decoded := []gopacket.LayerType{}
-	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeIPv4, &ip, &tcp)
-	err := parser.DecodeLayers(packet, &decoded)
-	if err != nil {
-		// XXX last 64 bits... we only use the last 32 bits
-		tcpHead := packet[len(packet)-8 : len(packet)]
-		tcpFlow := getTCPFlowFromTCPHead(tcpHead)
-		return flowKey{ip.NetworkFlow(), tcpFlow}
-	}
-	return flowKey{ip.NetworkFlow(), tcp.TransportFlow()}
 }

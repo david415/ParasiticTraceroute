@@ -29,6 +29,7 @@ package trace
 import (
 	"code.google.com/p/gopacket"
 	"code.google.com/p/gopacket/layers"
+	"encoding/binary"
 	"net"
 	"sort"
 	"sync"
@@ -143,4 +144,42 @@ func (f *FlowTracker) GetFlowTrace(flow flowKey) *NFQueueTraceroute {
 	f.lock.RLock()
 	ret := f.flowMap[flow]
 	return ret
+}
+
+// We use this to deal with rfc792 implementations where
+// the original packet is NOT sent back via ICMP payload but
+// instead 64 bits of the original packet are sent.
+// https://tools.ietf.org/html/rfc792
+// Returns a TCP Flow.
+// XXX obviously the 64 bits could be from a UDP packet or something else
+// however this is *good-enough* for NFQueue TCP traceroute!
+// XXX should we look at the protocol specified in the IP header
+// and set it's type here? no we should probably not even get this
+// far if the IP header has something other than TCP specified...
+func getTCPFlowFromTCPHead(data []byte) gopacket.Flow {
+	var srcPort, dstPort layers.TCPPort
+	srcPort = layers.TCPPort(binary.BigEndian.Uint16(data[0:2]))
+	dstPort = layers.TCPPort(binary.BigEndian.Uint16(data[2:4]))
+	// XXX convert to tcp/ip flow
+	tcpSrc := layers.NewTCPPortEndpoint(srcPort)
+	tcpDst := layers.NewTCPPortEndpoint(dstPort)
+	tcpFlow, _ := gopacket.FlowFromEndpoints(tcpSrc, tcpDst)
+	// error (^ _) is only non-nil if the two endpoint types don't match
+	return tcpFlow
+}
+
+// given a byte array packet return a tcp/ip flow
+func getPacketFlow(packet []byte) flowKey {
+	var ip layers.IPv4
+	var tcp layers.TCP
+	decoded := []gopacket.LayerType{}
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeIPv4, &ip, &tcp)
+	err := parser.DecodeLayers(packet, &decoded)
+	if err != nil {
+		// XXX last 64 bits... we only use the last 32 bits
+		tcpHead := packet[len(packet)-8 : len(packet)]
+		tcpFlow := getTCPFlowFromTCPHead(tcpHead)
+		return flowKey{ip.NetworkFlow(), tcpFlow}
+	}
+	return flowKey{ip.NetworkFlow(), tcp.TransportFlow()}
 }
