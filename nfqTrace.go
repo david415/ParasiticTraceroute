@@ -37,6 +37,7 @@ const (
 	MAX_TTL uint8 = 255
 )
 
+var repeatMode = flag.Bool("repeatMode", false, "repeatMode implies sending an additional packet instead of mangling the existing packet")
 var queueId = flag.Int("queue-id", 0, "NFQueue ID number")
 var queueSize = flag.Int("queue-size", 10000, "Maximum capacity of the NFQueue")
 var logFile = flag.String("log-file", "nfqtrace.log", "log file")
@@ -69,6 +70,7 @@ func main() {
 	log.SetOutput(f)
 
 	options := trace.NFQueueTraceObserverOptions{
+		RepeatMode:     *repeatMode,
 		QueueId:        *queueId,
 		QueueSize:      *queueSize,
 		Iface:          *iface,

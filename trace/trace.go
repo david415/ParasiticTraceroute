@@ -55,6 +55,7 @@ type NFQueueTraceObserverOptions struct {
 	TTLMax       uint8
 	TTLRepeatMax int
 
+	RepeatMode     bool
 	MangleFreq     int
 	TimeoutSeconds int
 }
@@ -144,7 +145,7 @@ func (o *NFQueueTraceObserver) processPacket(p netfilter.NFPacket) {
 
 	flow := flowKey{ip.NetworkFlow(), tcp.TransportFlow()}
 	if o.flowTracker.HasFlow(flow) == false {
-		nfqTrace := NewNFQueueTraceroute(flow, o, o.options.TTLMax, o.options.TTLRepeatMax, o.options.MangleFreq, o.options.TimeoutSeconds)
+		nfqTrace := NewNFQueueTraceroute(flow, o.options.RepeatMode, o, o.options.TTLMax, o.options.TTLRepeatMax, o.options.MangleFreq, o.options.TimeoutSeconds)
 		o.flowTracker.AddFlow(*ip, *tcp, nfqTrace)
 	}
 	nfqTrace := o.flowTracker.GetFlowTrace(flow)
@@ -275,9 +276,9 @@ func (r *TcpRoute) String() string {
 }
 
 type NFQueueTraceroute struct {
-	id flowKey
-
-	observer *NFQueueTraceObserver
+	id         flowKey
+	repeatMode bool
+	observer   *NFQueueTraceObserver
 
 	ttlMax         uint8 // the user specified maximum TTL for this tcp trace
 	ttlRepeatMax   int   // how many times shall we repeat each TTL?
@@ -305,9 +306,10 @@ type NFQueueTraceroute struct {
 // - send each TTL out ttlRepeatMax number of times.
 // - only mangle a packet's TTL after mangleFreq number
 // of packets have traversed the flow
-func NewNFQueueTraceroute(id flowKey, observer *NFQueueTraceObserver, ttlMax uint8, ttlRepeatMax, mangleFreq, timeoutSeconds int) *NFQueueTraceroute {
+func NewNFQueueTraceroute(id flowKey, repeatMode bool, observer *NFQueueTraceObserver, ttlMax uint8, ttlRepeatMax, mangleFreq, timeoutSeconds int) *NFQueueTraceroute {
 	nfqTrace := NFQueueTraceroute{
 		id:                  id,
+		repeatMode:          repeatMode,
 		observer:            observer,
 		ttl:                 1,
 		ttlMax:              ttlMax,
@@ -390,7 +392,11 @@ func (n *NFQueueTraceroute) processPacket(p netfilter.NFPacket) {
 			}
 		}
 		if n.ttlRepeat < n.ttlRepeatMax {
-			p.SetModifiedVerdict(netfilter.NF_REPEAT, serializeWithTTL(p.Packet, n.ttl))
+			if n.repeatMode {
+				p.SetModifiedVerdict(netfilter.NF_REPEAT, serializeWithTTL(p.Packet, n.ttl))
+			} else {
+				p.SetModifiedVerdict(netfilter.NF_ACCEPT, serializeWithTTL(p.Packet, n.ttl))
+			}
 			n.ttlRepeat += 1
 		} else {
 			p.SetVerdict(netfilter.NF_ACCEPT)
