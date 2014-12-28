@@ -54,6 +54,9 @@ note: you must have your golang build environment setup properly to build **go-n
 usage
 -----
 
+This API could be used to create new interesting TCP traceroute related applications. Here's the godoc generated API documentation:
+http://godoc.org/github.com/david415/ParasiticTraceroute/trace
+
 **you must set an iptables rule so that packets are sent to the nfqueue!**
 
 perform reverse TCP traceroute on all connections to a local server like this::
@@ -82,46 +85,12 @@ currently this is what the usage looks like::
 
 future features
 ---------------
-1. session close detection
-2. end of trace detection
-3. set and remove cleanly the iptables nfqueue rule
-4. use setcap facility and drop privileges
-5. add a timestamp to each result item
-6. add packet round trip time to each result item
-7. repeatedly perform the trace on connections that stay open; This feature addition implies contiuously appending to a trace result list for a given connction...
-8. optionally do not man-in-the-middle stream packets but send out "duplicates" instead
-9. add option to stream results to stdout instead of a file
+1. end of trace detection
+2. set and remove cleanly the iptables nfqueue rule
+3. use setcap facility and drop privileges
+4. add packet round trip time to each result item
+5. repeatedly perform the trace on connections that stay open; This feature addition implies contiuously appending to a trace result list for a given connction...
 
-
-=================================
-nfqtraceClient and nfqtraceServer
-=================================
-
-abstract
---------
-Bidirectional TCP traceroute using a cooperative client server protocol.
-
-
-status
-------
-**Design phase.**
-
-
-design notes
-------------
-
-* client and server tcp protocol using JSON to distringuish trace results from noise-data used to generate the trace...
-* server streams results to client as soon as available ( clients determins it's own TCP source port and uses that to track the outgoing NFQueue flow
-
-
-usage notes
------------
-
-These are represent a rought sketch... and to be clear there must be many more commandline options; all the options that nfqtrace has apply here.
-
-* nfqclient <server ip>:<server port> -client-mangle-freq <int> -client-send-dups=<bool> -server-mangle-freq=<int> -server-send-dups=<bool>
-
-* nfqserver -interface=<network interface> -port=<tcp port>
 
 
 ================
