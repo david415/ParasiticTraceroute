@@ -24,6 +24,7 @@
  *
  */
 
+// Parasitic Traceroute API -  Forward/Reverse TCP traceroute API which uses Linux Netfilter Queue
 package trace
 
 import (
@@ -41,10 +42,12 @@ import (
 )
 
 const (
+	// IP TTL is a uint8 and therefore max value is 255
 	MAX_TTL uint8 = 255
 )
 
-// used as a channel type
+// TcpIpLayer struct is used as a channel type for passing tcp/ip packet data
+// from the pcap sniffer to the TCP-session-close goroutine-channel pipeline.
 type TcpIpLayer struct {
 	ip  layers.IPv4
 	tcp layers.TCP
@@ -54,48 +57,73 @@ func (t *TcpIpLayer) Layers() (layers.IPv4, layers.TCP) {
 	return t.ip, t.tcp
 }
 
-// used as a channel type
+// PayloadIcmpIpLayer struct is used as a channel type for passing icmp/ip packet data
+// from the pcap sniffer to the traceroute-receive-ICMP-reply goroutine-channel pipeline.
 type PayloadIcmpIpLayer struct {
 	ip      layers.IPv4
 	icmp    layers.ICMPv4
 	payload gopacket.Payload
 }
 
+// NFQueueTraceObserverOptions struct is a helper struct used to encapsulate
+// the user tuned parameters for NFQueueTraceObserver struct.
 type NFQueueTraceObserverOptions struct {
-	// network interface to listen for ICMP responses
-	QueueId   int
+
+	// QueueId is the Netfilter Queue we should use
+	QueueId int
+	// The maximum number of packets the queue is capable of storing
 	QueueSize int
 
+	// Iface is a network interface to listen for ICMP-TTL-expired packets and TCP FIN packets
 	Iface string
 
-	TTLMax       uint8
+	// TTLMax specifies the highest TTL value to use in the TCP traceroute
+	TTLMax uint8
+	// TTLRepeatMax specifies the number of times to send a given TTL for the traceroute
 	TTLRepeatMax int
 
-	RepeatMode     bool
-	MangleFreq     int
+	// RepeatMode implies NFQueue verdict NF_REPEAT
+	// which means sending a duplicate packet
+	RepeatMode bool
+	// MangleFreq is the number of packets that should traverse
+	// a tracked flow before we mangle a packet's TTL for the traceroute operation
+	MangleFreq int
+	// TimeoutSeconds is the number of seconds to wait before incrementing the TTL
+	// and further mangling packets for a given flow.
 	TimeoutSeconds int
 }
 
+// NFQueueTraceObserver is a struct used to track concurrents TCP traceroute operations
+// in TCP streams it observes in the specified Netfilter Queue.
 type NFQueueTraceObserver struct {
-	// passed in from the user in our constructor...
+	// options is passed in from the user in our constructor NewNFQueueTraceObserver
 	options NFQueueTraceObserverOptions
-	nfq     *netfilter.NFQueue
+	// nfq is used to talk to the Netfilter Queue
+	nfq *netfilter.NFQueue
 
+	// flowTracker helps use identify which traceroute operation a packet belongs to
 	flowTracker *FlowTracker
 
-	// packet channel for interacting with NFQueue
+	// packets is a channel for interacting with NFQueue
 	packets <-chan netfilter.NFPacket
-	// this is used to stop all the traceroutes
+	// done channel is used to stop all the traceroutes
 	done chan bool
 
-	stopReceiveChan  chan bool
-	receiveParseChan chan []byte
-	receiveTcpChan   chan TcpIpLayer
-	receiveIcmpChan  chan PayloadIcmpIpLayer
+	// stopReceiveChan is used to stop the pcap sniffer goroutine
+	// used for capturing ICMP replies and TCP FIN packets
+	stopReceiveChan chan bool
 
+	// receiveParseChan is written to by the goroutine reading packets off the wire
+	receiveParseChan chan []byte
+	// receiveTcpChan is written to by the packet parsing goroutine
+	receiveTcpChan chan TcpIpLayer
+	// receiveIcmpChan is written to by the packet parsing goroutine
+	receiveIcmpChan chan PayloadIcmpIpLayer
+	// addResultMutex is used to serialize writing traceroute results to the logfile
 	addResultMutex sync.Mutex
 }
 
+// NewNFQueueTraceObserver creates a NFQueueTraceObserver struct given a NFQueueTraceObserverOptions struct
 func NewNFQueueTraceObserver(options NFQueueTraceObserverOptions) *NFQueueTraceObserver {
 	var err error
 	o := NFQueueTraceObserver{
@@ -117,6 +145,10 @@ func NewNFQueueTraceObserver(options NFQueueTraceObserverOptions) *NFQueueTraceO
 	return &o
 }
 
+// Start method creates two goroutines.
+// 1. read packets from NFQueue and pipeline to traceroute operation
+// 2. read packets from pcap sniffer and pipeline
+// to process TCP FIN packets and ICMP TTL expired traceroute responses
 func (o *NFQueueTraceObserver) Start() {
 	log.Print("NFQueueTraceObserver Start\n")
 	o.startReceivingReplies()
@@ -135,12 +167,14 @@ func (o *NFQueueTraceObserver) Start() {
 	}()
 }
 
+// Stop method is an unfinished work in progress.
+// Currently it only stoped the NFQueue packet processing goroutine.
 func (o *NFQueueTraceObserver) Stop() {
 	log.Print("NFQueueTraceObserver Stop\n")
 	o.done <- true
 }
 
-// log trace results
+// receiveTraceRoute method uses a mutex to serialize writing trace results to a logfile
 func (o *NFQueueTraceObserver) receiveTraceRoute(traceID flowKey, route TcpRoute) string {
 	defer o.addResultMutex.Unlock()
 	o.addResultMutex.Lock()
@@ -156,7 +190,8 @@ func (o *NFQueueTraceObserver) receiveTraceRoute(traceID flowKey, route TcpRoute
 	return buffer.String()
 }
 
-// XXX make the locking more efficient?
+// processPacket method parses packets read from the NFQueue
+// and dispatches them to the appropriate traceroute pipeline
 func (o *NFQueueTraceObserver) processPacket(p netfilter.NFPacket) {
 	ipLayer := p.Packet.Layer(layers.LayerTypeIPv4)
 	tcpLayer := p.Packet.Layer(layers.LayerTypeTCP)
@@ -176,6 +211,7 @@ func (o *NFQueueTraceObserver) processPacket(p netfilter.NFPacket) {
 	nfqTrace.processPacket(p)
 }
 
+// startReceivingReplies createa a goroutine to read packets via a pcap sniffer
 func (o *NFQueueTraceObserver) startReceivingReplies() {
 	log.Print("startReceivingReplies\n")
 	snaplen := 65536
@@ -207,6 +243,10 @@ func (o *NFQueueTraceObserver) startReceivingReplies() {
 	}()
 }
 
+// startParsingReplies starts a goroutine which participates
+// in the pcap sniffing pipeline by reading packets from
+// it's channel and writing them to an output channel;
+// either the TCP or ICMP output channels.
 func (o *NFQueueTraceObserver) startParsingReplies() {
 	var eth layers.Ethernet
 	var ip layers.IPv4
@@ -248,6 +288,10 @@ func (o *NFQueueTraceObserver) startParsingReplies() {
 	}()
 }
 
+// startReceivingIcmp creates a goroutine to read ICMP packets
+// from it's input channel... determine if the packet is a TTL-expired
+// ICMP response from one of our traceroute operations. If so then
+// output to that traceroute's channel
 func (o *NFQueueTraceObserver) startReceivingIcmp() {
 	go func() {
 		// bundle is network protocol layer cake payload/icmp/ip
@@ -271,6 +315,10 @@ func (o *NFQueueTraceObserver) startReceivingIcmp() {
 	}()
 }
 
+// startWatchingForTcpClose receives packets from the pcap
+// packet parsing goroutine. We simply consume packets looking
+// for a familiar TCP connection. If we see a FIN packet we
+// stop the traceroute operation.
 func (o *NFQueueTraceObserver) startWatchingForTcpClose() {
 	go func() {
 		for tcpIpLayer := range o.receiveTcpChan {
@@ -293,6 +341,7 @@ type HopTick struct {
 	ip      net.IP
 }
 
+// String returns a string representation of a HopTick
 func (t *HopTick) String() string {
 	return fmt.Sprintf("%s %s", t.ip.String(), t.instant.String())
 }
@@ -304,20 +353,25 @@ type TcpRoute struct {
 	routeMap map[uint8][]HopTick
 }
 
+// NewTcpRoute returns a TcpRoute struct
 func NewTcpRoute() TcpRoute {
 	return TcpRoute{
 		routeMap: make(map[uint8][]HopTick, 1),
 	}
 }
 
+// AddHopTick takes a TTL and HopTick and adds them to a
+// hashmap where the TTL is the key.
 func (r *TcpRoute) AddHopTick(ttl uint8, hoptick HopTick) {
 	r.routeMap[ttl] = append(r.routeMap[ttl], hoptick)
 }
 
+// GetRepeatLength returns the number of HopTicks accumulated for a given TTL
 func (r *TcpRoute) GetRepeatLength(ttl uint8) int {
 	return len(r.routeMap[ttl])
 }
 
+// GetSortedKeys returns a slice of sorted keys (TTL) from our routeMap
 func (r *TcpRoute) GetSortedKeys() []int {
 	var keys []int
 	for k := range r.routeMap {
@@ -327,6 +381,7 @@ func (r *TcpRoute) GetSortedKeys() []int {
 	return keys
 }
 
+// String returns a string representation of the thus far accumulated traceroute information
 func (r *TcpRoute) String() string {
 	var buffer bytes.Buffer
 	hops := r.GetSortedKeys()
@@ -340,6 +395,8 @@ func (r *TcpRoute) String() string {
 	return buffer.String()
 }
 
+// NFQueueTraceroute struct is used to perform traceroute operations
+// on a single TCP flow... where flow means a unidirection packet stream.
 type NFQueueTraceroute struct {
 	id         flowKey
 	repeatMode bool
@@ -365,10 +422,9 @@ type NFQueueTraceroute struct {
 	restartTimerChannel chan bool
 }
 
-// conduct an nfqueue tcp traceroute;
-// - send each TTL out ttlRepeatMax number of times.
-// - only mangle a packet's TTL after mangleFreq number
-// of packets have traversed the flow
+// NewNFQueueTraceroute returns a new NFQueueTraceroute struct and starts two goroutines;
+// a timer goroutine for determining when to increment the TTL for the traceroute operation...
+// and a goroutine to process ICMP-TTL-expired responses.
 func NewNFQueueTraceroute(id flowKey, repeatMode bool, observer *NFQueueTraceObserver, ttlMax uint8, ttlRepeatMax, mangleFreq, timeoutSeconds int) *NFQueueTraceroute {
 	nfqTrace := NFQueueTraceroute{
 		id:                  id,
@@ -393,6 +449,8 @@ func NewNFQueueTraceroute(id flowKey, repeatMode bool, observer *NFQueueTraceObs
 	return &nfqTrace
 }
 
+// StartReponseTimer starts a goroutine to provide a timeout service
+// to the traceroute operaton...
 func (n *NFQueueTraceroute) StartResponseTimer() {
 
 	go func() {
@@ -417,10 +475,14 @@ func (n *NFQueueTraceroute) StartResponseTimer() {
 	}()
 }
 
+// submitResult... no comment because this is stupid and needs to go away and die.
 func (n *NFQueueTraceroute) submitResult() {
 	log.Print(n.observer.receiveTraceRoute(n.id, n.tcpRoute))
 }
 
+// Stop stops the timeout goroutine... but it should be further extended to
+// shutdown the entire traceroute operation which means dealing with other
+// goroutines.
 func (n *NFQueueTraceroute) Stop() {
 	log.Print("stop traceroute\n")
 	n.stopped = true
@@ -430,8 +492,8 @@ func (n *NFQueueTraceroute) Stop() {
 	n.submitResult()
 }
 
-// given a packet we decided weather or not to mangle the TTL
-// for our tracerouting purposes.
+// processPacket receives packets from the NFQueue and decides weather
+// or not to mangle the TTL for our tracerouting purposes.
 func (n *NFQueueTraceroute) processPacket(p netfilter.NFPacket) {
 
 	if n.stopped {
@@ -472,6 +534,8 @@ func (n *NFQueueTraceroute) processPacket(p netfilter.NFPacket) {
 	n.count = n.count + 1
 }
 
+// startReceivingReplies starts a goroutine which receives ICMP-TTL-expired replies
+// belonging to our TCP traceroute flow.
 func (n *NFQueueTraceroute) startReceivingReplies() {
 	go func() {
 		for replyIP := range n.receiveReplyChan {
@@ -487,30 +551,4 @@ func (n *NFQueueTraceroute) startReceivingReplies() {
 			}
 		}
 	}()
-}
-
-// This function takes a gopacket.Packet and a TTL
-// and returns a byte array of the serialized packet with the specified TTL
-func serializeWithTTL(p gopacket.Packet, ttl uint8) []byte {
-	ipLayer := p.Layer(layers.LayerTypeIPv4)
-	if ipLayer == nil {
-		return nil
-	}
-	tcpLayer := p.Layer(layers.LayerTypeTCP)
-	if tcpLayer == nil {
-		return nil
-	}
-	ip, _ := ipLayer.(*layers.IPv4)
-	ip.TTL = ttl
-	tcp, _ := tcpLayer.(*layers.TCP)
-	opts := gopacket.SerializeOptions{
-		FixLengths:       true,
-		ComputeChecksums: true,
-	}
-	tcp.SetNetworkLayerForChecksum(ip)
-	rawPacketBuf := gopacket.NewSerializeBuffer()
-	if err := gopacket.SerializeLayers(rawPacketBuf, opts, ip, tcp); err != nil {
-		return nil
-	}
-	return rawPacketBuf.Bytes()
 }

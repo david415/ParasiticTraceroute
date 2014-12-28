@@ -24,6 +24,7 @@
  *
  */
 
+// Parasitic Traceroute API -  Forward/Reverse TCP traceroute API which uses Linux Netfilter Queue
 package trace
 
 import (
@@ -35,15 +36,20 @@ import (
 	"sync"
 )
 
-// this is a composite struct type called "flowKey"
-// used to track tcp/ip flows... as a hashmap key.
+// flowKey is a composite struct type used to track tcp/ip flows...
+// as a hashmap key.
+// flowKey needs to go away and die... mostly because
+// it's a composite struct which doesn't have any methods
+// to enforce correct usage... I will therefore replace it
+// with a struct with methods.
 type flowKey [2]gopacket.Flow
 
-// this is directional... it matches a specific TCP flow direction.
+// TcpFlowKey is directional... it matches a specific TCP flow direction.
 type TcpFlowKey struct {
 	flow [2]gopacket.Flow
 }
 
+// NewTcpFlowKey returns a new TcpFlowKey struct
 func NewTcpFlowKey(ipFlow gopacket.Flow, tcpFlow gopacket.Flow) TcpFlowKey {
 	return TcpFlowKey{
 		flow: [2]gopacket.Flow{
@@ -53,12 +59,14 @@ func NewTcpFlowKey(ipFlow gopacket.Flow, tcpFlow gopacket.Flow) TcpFlowKey {
 	}
 }
 
-// bidirectional in this case means that each of these keys
+// TcpBidirectionalFlowKey struct can be used as a hashmap key.
+// Bidirectional in this case means that each of these keys
 // for each TCP connection can be represented by two TcpFlowKey`s
 type TcpBidirectionalFlowKey struct {
 	flow flowKey
 }
 
+// NewTcpBidirectionalFlowKey returns a new TcpBidirectionalFlowKey struct
 func NewTcpBidirectionalFlowKey(ip layers.IPv4, tcp layers.TCP) TcpBidirectionalFlowKey {
 	var tcpSrc gopacket.Endpoint
 	var tcpDst gopacket.Endpoint
@@ -86,18 +94,19 @@ func NewTcpBidirectionalFlowKey(ip layers.IPv4, tcp layers.TCP) TcpBidirectional
 	}
 }
 
-// XXX probably not useful
+// Get method is XXX probably not useful
 func (f *TcpBidirectionalFlowKey) Get() flowKey {
 	return f.flow
 }
 
-// concurrent-safe hashmap of tcp/ip-flowKeys to NFQueueTraceroute`s
+// FlowTracker struct is a concurrent-safe hashmap of tcp/ip-flowKeys to NFQueueTraceroute`s
 type FlowTracker struct {
 	lock          *sync.RWMutex
 	flowMap       map[flowKey]*NFQueueTraceroute
 	connectionMap map[TcpBidirectionalFlowKey]*NFQueueTraceroute
 }
 
+// NewFlowTracker returns a new FlowTracker struct
 func NewFlowTracker() *FlowTracker {
 	return &FlowTracker{
 		lock:          new(sync.RWMutex),
@@ -106,6 +115,8 @@ func NewFlowTracker() *FlowTracker {
 	}
 }
 
+// HasFlow returns true if the specified flowKey is
+// a key in our flowMap hashmap.
 func (f *FlowTracker) HasFlow(flow flowKey) bool {
 	defer f.lock.RUnlock()
 	f.lock.RLock()
@@ -113,6 +124,8 @@ func (f *FlowTracker) HasFlow(flow flowKey) bool {
 	return ok
 }
 
+// HasConnection returns true if the specified TcpBidirectionalFlowKey
+// is a key in our connectionMap hashmap.
 func (f *FlowTracker) HasConnection(biflow TcpBidirectionalFlowKey) bool {
 	defer f.lock.RUnlock()
 	f.lock.RLock()
@@ -120,11 +133,14 @@ func (f *FlowTracker) HasConnection(biflow TcpBidirectionalFlowKey) bool {
 	return ok
 }
 
+// GetConnectionTrace returns the NFQueueTraceroute struct pointer associated with
+// a specified TcpBidirectionalFlowKey
 func (f *FlowTracker) GetConnectionTrace(flow TcpBidirectionalFlowKey) *NFQueueTraceroute {
 	return f.connectionMap[flow]
 }
 
-//XXX needs some cleanup
+// AddFlow adds a NFQueueTraceroute struct pointer to our bookeeping hashmaps
+//XXX needs some cleanup?
 func (f *FlowTracker) AddFlow(ip layers.IPv4, tcp layers.TCP, nfqTrace *NFQueueTraceroute) {
 	defer f.lock.Unlock()
 	f.lock.Lock()
@@ -133,12 +149,15 @@ func (f *FlowTracker) AddFlow(ip layers.IPv4, tcp layers.TCP, nfqTrace *NFQueueT
 	f.connectionMap[NewTcpBidirectionalFlowKey(ip, tcp)] = nfqTrace
 }
 
+// Delete... this needs to go away. Not used.
 func (f *FlowTracker) Delete(flow flowKey) {
 	defer f.lock.Unlock()
 	f.lock.Lock()
 	delete(f.flowMap, flow)
 }
 
+// GetFlowTrace returns a NFQueueTraceroute struct pointer
+// given a flowKey
 func (f *FlowTracker) GetFlowTrace(flow flowKey) *NFQueueTraceroute {
 	defer f.lock.RUnlock()
 	f.lock.RLock()
@@ -146,16 +165,15 @@ func (f *FlowTracker) GetFlowTrace(flow flowKey) *NFQueueTraceroute {
 	return ret
 }
 
-// We use this to deal with rfc792 implementations where
-// the original packet is NOT sent back via ICMP payload but
+// getTCPFlowFromTCPHead is used to deal with rfc792 implementations where
+// the original outbound packet is NOT sent back via ICMP payload but
 // instead 64 bits of the original packet are sent.
 // https://tools.ietf.org/html/rfc792
-// Returns a TCP Flow.
+// Returns assumes TCP and returns a gopacket.Flow.
 // XXX obviously the 64 bits could be from a UDP packet or something else
 // however this is *good-enough* for NFQueue TCP traceroute!
-// XXX should we look at the protocol specified in the IP header
-// and set it's type here? no we should probably not even get this
-// far if the IP header has something other than TCP specified...
+// XXX should perhaps look at the protocol number specified in the IP header
+// and set it's type here? I don't have a use-case for that right now.
 func getTCPFlowFromTCPHead(data []byte) gopacket.Flow {
 	var srcPort, dstPort layers.TCPPort
 	srcPort = layers.TCPPort(binary.BigEndian.Uint16(data[0:2]))
@@ -168,7 +186,8 @@ func getTCPFlowFromTCPHead(data []byte) gopacket.Flow {
 	return tcpFlow
 }
 
-// given a byte array packet return a tcp/ip flow
+// getPacketFlow returns a tcp/ip flowKey
+// given a byte array packet
 func getPacketFlow(packet []byte) flowKey {
 	var ip layers.IPv4
 	var tcp layers.TCP
@@ -182,4 +201,30 @@ func getPacketFlow(packet []byte) flowKey {
 		return flowKey{ip.NetworkFlow(), tcpFlow}
 	}
 	return flowKey{ip.NetworkFlow(), tcp.TransportFlow()}
+}
+
+// serializeWithTTL takes a gopacket.Packet and a TTL
+// and returns a byte array of the serialized packet with the specified TTL
+func serializeWithTTL(p gopacket.Packet, ttl uint8) []byte {
+	ipLayer := p.Layer(layers.LayerTypeIPv4)
+	if ipLayer == nil {
+		return nil
+	}
+	tcpLayer := p.Layer(layers.LayerTypeTCP)
+	if tcpLayer == nil {
+		return nil
+	}
+	ip, _ := ipLayer.(*layers.IPv4)
+	ip.TTL = ttl
+	tcp, _ := tcpLayer.(*layers.TCP)
+	opts := gopacket.SerializeOptions{
+		FixLengths:       true,
+		ComputeChecksums: true,
+	}
+	tcp.SetNetworkLayerForChecksum(ip)
+	rawPacketBuf := gopacket.NewSerializeBuffer()
+	if err := gopacket.SerializeLayers(rawPacketBuf, opts, ip, tcp); err != nil {
+		return nil
+	}
+	return rawPacketBuf.Bytes()
 }
