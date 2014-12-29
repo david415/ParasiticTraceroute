@@ -208,7 +208,7 @@ func (o *NFQueueTraceObserver) processPacket(p netfilter.NFPacket) {
 		o.flowTracker.AddFlow(*ip, *tcp, nfqTrace)
 	}
 	nfqTrace := o.flowTracker.GetFlowTrace(flow)
-	nfqTrace.processPacket(p)
+	nfqTrace.nfqPacketChan <- p
 }
 
 // startReceivingReplies createa a goroutine to read packets via a pcap sniffer
@@ -416,6 +416,7 @@ type NFQueueTraceroute struct {
 	stopped          bool
 	responseTimedOut bool
 
+	nfqPacketChan    chan netfilter.NFPacket
 	receiveReplyChan chan net.IP
 
 	stopTimerChannel    chan bool
@@ -440,12 +441,14 @@ func NewNFQueueTraceroute(id flowKey, repeatMode bool, observer *NFQueueTraceObs
 		stopped:             false,
 		timeoutSeconds:      timeoutSeconds,
 		responseTimedOut:    false,
+		nfqPacketChan:       make(chan netfilter.NFPacket),
 		receiveReplyChan:    make(chan net.IP),
 		stopTimerChannel:    make(chan bool),
 		restartTimerChannel: make(chan bool),
 	}
 	nfqTrace.StartResponseTimer()
 	nfqTrace.startReceivingReplies()
+	nfqTrace.startReadingNfqPackets()
 	return &nfqTrace
 }
 
@@ -490,6 +493,16 @@ func (n *NFQueueTraceroute) Stop() {
 	close(n.stopTimerChannel)
 	close(n.restartTimerChannel)
 	n.submitResult()
+}
+
+// startReadingNfqPackets reads NFPackets from the channel
+// and calls processPacket to do something with the packet
+func (n *NFQueueTraceroute) startReadingNfqPackets() {
+	go func() {
+		for nfqPacket := range n.nfqPacketChan {
+			n.processPacket(nfqPacket)
+		}
+	}()
 }
 
 // processPacket receives packets from the NFQueue and decides weather
