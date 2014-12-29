@@ -34,11 +34,13 @@ import (
 	"sync"
 )
 
+// TcpIpFlow is used for tracking unidirectional TCP flows
 type TcpIpFlow struct {
 	ipFlow  gopacket.Flow
 	tcpFlow gopacket.Flow
 }
 
+// NewTcpIpFlowFromLayers given IPv4 and TCP layers it returns a TcpIpFlow
 func NewTcpIpFlowFromLayers(ipLayer layers.IPv4, tcpLayer layers.TCP) TcpIpFlow {
 	return TcpIpFlow{
 		ipFlow:  ipLayer.NetworkFlow(),
@@ -46,6 +48,7 @@ func NewTcpIpFlowFromLayers(ipLayer layers.IPv4, tcpLayer layers.TCP) TcpIpFlow 
 	}
 }
 
+// NewTcpIpFlowFromFlows given an IP flow and TCP flow returns a TcpIpFlow
 func NewTcpIpFlowFromFlows(ipFlow gopacket.Flow, tcpFlow gopacket.Flow) TcpIpFlow {
 	// XXX todo: check that the flow types are correct
 	return TcpIpFlow{
@@ -77,6 +80,7 @@ func NewTcpIpFlowFromPacket(packet []byte) TcpIpFlow {
 	}
 }
 
+// Layers returns the component flow structs IPv4, TCP
 func (t *TcpIpFlow) Layers() (gopacket.Flow, gopacket.Flow) {
 	return t.ipFlow, t.tcpFlow
 }
