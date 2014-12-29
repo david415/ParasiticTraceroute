@@ -445,7 +445,7 @@ func NewNFQueueTraceroute(id TcpIpFlow, repeatMode bool, observer *NFQueueTraceO
 		stopTimerChannel:    make(chan bool),
 		restartTimerChannel: make(chan bool),
 	}
-	nfqTrace.StartResponseTimer()
+	nfqTrace.startResponseTimer()
 	nfqTrace.startReceivingReplies()
 	nfqTrace.startReadingNfqPackets()
 	return &nfqTrace
@@ -453,7 +453,7 @@ func NewNFQueueTraceroute(id TcpIpFlow, repeatMode bool, observer *NFQueueTraceO
 
 // StartReponseTimer starts a goroutine to provide a timeout service
 // to the traceroute operaton...
-func (n *NFQueueTraceroute) StartResponseTimer() {
+func (n *NFQueueTraceroute) startResponseTimer() {
 
 	go func() {
 		for {
