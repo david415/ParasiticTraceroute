@@ -175,12 +175,11 @@ func (o *NFQueueTraceObserver) Stop() {
 }
 
 // receiveTraceRoute method uses a mutex to serialize writing trace results to a logfile
-func (o *NFQueueTraceObserver) receiveTraceRoute(traceID flowKey, route TcpRoute) string {
+func (o *NFQueueTraceObserver) receiveTraceRoute(traceID TcpIpFlow, route TcpRoute) string {
 	defer o.addResultMutex.Unlock()
 	o.addResultMutex.Lock()
 
-	ipFlow := traceID[0]
-	tcpFlow := traceID[1]
+	ipFlow, tcpFlow := traceID.Layers()
 	srcIP, dstIP := ipFlow.Endpoints()
 	srcPort, dstPort := tcpFlow.Endpoints()
 
@@ -201,13 +200,12 @@ func (o *NFQueueTraceObserver) processPacket(p netfilter.NFPacket) {
 	}
 	ip, _ := ipLayer.(*layers.IPv4)
 	tcp, _ := tcpLayer.(*layers.TCP)
-
-	flow := flowKey{ip.NetworkFlow(), tcp.TransportFlow()}
-	if o.flowTracker.HasFlow(flow) == false {
-		nfqTrace := NewNFQueueTraceroute(flow, o.options.RepeatMode, o, o.options.TTLMax, o.options.TTLRepeatMax, o.options.MangleFreq, o.options.TimeoutSeconds)
-		o.flowTracker.AddFlow(*ip, *tcp, nfqTrace)
+	tcpipflow := NewTcpIpFlowFromFlows(ip.NetworkFlow(), tcp.TransportFlow())
+	if o.flowTracker.HasFlow(tcpipflow) == false {
+		nfqTrace := NewNFQueueTraceroute(tcpipflow, o.options.RepeatMode, o, o.options.TTLMax, o.options.TTLRepeatMax, o.options.MangleFreq, o.options.TimeoutSeconds)
+		o.flowTracker.AddFlow(tcpipflow, nfqTrace)
 	}
-	nfqTrace := o.flowTracker.GetFlowTrace(flow)
+	nfqTrace := o.flowTracker.GetFlow(tcpipflow)
 	nfqTrace.nfqPacketChan <- p
 }
 
@@ -302,12 +300,12 @@ func (o *NFQueueTraceObserver) startReceivingIcmp() {
 				continue
 			}
 			// XXX todo: check that the IP header protocol value is set to TCP
-			flow := getPacketFlow(bundle.payload)
-			if o.flowTracker.HasFlow(flow) == false {
+			flow := NewTcpIpFlowFromPacket(bundle.payload)
+			if o.flowTracker.HasFlow(NewTcpIpFlowFromPacket(bundle.payload)) == false {
 				// ignore ICMP ttl expire packets that are for flows other than the ones we are currently tracking
 				continue
 			}
-			nfqTrace := o.flowTracker.GetFlowTrace(flow)
+			nfqTrace := o.flowTracker.GetFlow(flow)
 
 			nfqTrace.receiveReplyChan <- bundle.ip.SrcIP
 			//nfqTrace.replyReceived(bundle.ip.SrcIP)
@@ -323,7 +321,8 @@ func (o *NFQueueTraceObserver) startWatchingForTcpClose() {
 	go func() {
 		for tcpIpLayer := range o.receiveTcpChan {
 			ip, tcp := tcpIpLayer.Layers()
-			tcpBiFlowKey := NewTcpBidirectionalFlowKey(ip, tcp)
+			tcpipflow := NewTcpIpFlowFromLayers(ip, tcp)
+			tcpBiFlowKey := NewTcpBidirectionalFlowKeyFromTcpIpFlow(tcpipflow)
 			if o.flowTracker.HasConnection(tcpBiFlowKey) {
 				if tcp.FIN {
 					log.Print("receiveTcp FIN detected\n")
@@ -398,7 +397,7 @@ func (r *TcpRoute) String() string {
 // NFQueueTraceroute struct is used to perform traceroute operations
 // on a single TCP flow... where flow means a unidirection packet stream.
 type NFQueueTraceroute struct {
-	id         flowKey
+	id         TcpIpFlow
 	repeatMode bool
 	observer   *NFQueueTraceObserver
 
@@ -426,7 +425,7 @@ type NFQueueTraceroute struct {
 // NewNFQueueTraceroute returns a new NFQueueTraceroute struct and starts two goroutines;
 // a timer goroutine for determining when to increment the TTL for the traceroute operation...
 // and a goroutine to process ICMP-TTL-expired responses.
-func NewNFQueueTraceroute(id flowKey, repeatMode bool, observer *NFQueueTraceObserver, ttlMax uint8, ttlRepeatMax, mangleFreq, timeoutSeconds int) *NFQueueTraceroute {
+func NewNFQueueTraceroute(id TcpIpFlow, repeatMode bool, observer *NFQueueTraceObserver, ttlMax uint8, ttlRepeatMax, mangleFreq, timeoutSeconds int) *NFQueueTraceroute {
 	nfqTrace := NFQueueTraceroute{
 		id:                  id,
 		repeatMode:          repeatMode,
@@ -490,6 +489,8 @@ func (n *NFQueueTraceroute) Stop() {
 	log.Print("stop traceroute\n")
 	n.stopped = true
 	n.stopTimerChannel <- true
+	close(n.nfqPacketChan)
+	close(n.receiveReplyChan)
 	close(n.stopTimerChannel)
 	close(n.restartTimerChannel)
 	n.submitResult()
@@ -533,9 +534,9 @@ func (n *NFQueueTraceroute) processPacket(p netfilter.NFPacket) {
 		}
 		if n.ttlRepeat < n.ttlRepeatMax {
 			if n.repeatMode {
-				p.SetModifiedVerdict(netfilter.NF_REPEAT, serializeWithTTL(p.Packet, n.ttl))
+				p.SetModifiedVerdict(netfilter.NF_REPEAT, SerializeWithTTL(p.Packet, n.ttl))
 			} else {
-				p.SetModifiedVerdict(netfilter.NF_ACCEPT, serializeWithTTL(p.Packet, n.ttl))
+				p.SetModifiedVerdict(netfilter.NF_ACCEPT, SerializeWithTTL(p.Packet, n.ttl))
 			}
 			n.ttlRepeat += 1
 		} else {
