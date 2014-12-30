@@ -28,7 +28,6 @@
 package trace
 
 import (
-	"bytes"
 	"code.google.com/p/gopacket"
 	"code.google.com/p/gopacket/layers"
 	"code.google.com/p/gopacket/pcap"
@@ -36,7 +35,6 @@ import (
 	"github.com/david415/go-netfilter-queue"
 	"log"
 	"net"
-	"sort"
 	"sync"
 	"time"
 )
@@ -45,6 +43,17 @@ const (
 	// IP TTL is a uint8 and therefore max value is 255
 	MAX_TTL uint8 = 255
 )
+
+// HopTick represents a single route hop at a particular instant
+type HopTick struct {
+	instant time.Time
+	ip      net.IP
+}
+
+// String returns a string representation of a HopTick
+func (t *HopTick) String() string {
+	return fmt.Sprintf("%s %s", t.ip.String(), t.instant.String())
+}
 
 // TcpIpLayer struct is used as a channel type for passing tcp/ip packet data
 // from the pcap sniffer to the TCP-session-close goroutine-channel pipeline.
@@ -91,6 +100,8 @@ type NFQueueTraceObserverOptions struct {
 	// TimeoutSeconds is the number of seconds to wait before incrementing the TTL
 	// and further mangling packets for a given flow.
 	TimeoutSeconds int
+
+	RouteLogger RouteLogger
 }
 
 // NFQueueTraceObserver is a struct used to track concurrents TCP traceroute operations
@@ -171,22 +182,8 @@ func (o *NFQueueTraceObserver) Start() {
 // Currently it only stoped the NFQueue packet processing goroutine.
 func (o *NFQueueTraceObserver) Stop() {
 	log.Print("NFQueueTraceObserver Stop\n")
+	o.stopReceiveChan <- true
 	o.done <- true
-}
-
-// receiveTraceRoute method uses a mutex to serialize writing trace results to a logfile
-func (o *NFQueueTraceObserver) receiveTraceRoute(traceID TcpIpFlow, route TcpRoute) string {
-	defer o.addResultMutex.Unlock()
-	o.addResultMutex.Lock()
-
-	ipFlow, tcpFlow := traceID.Layers()
-	srcIP, dstIP := ipFlow.Endpoints()
-	srcPort, dstPort := tcpFlow.Endpoints()
-
-	var buffer bytes.Buffer
-	buffer.WriteString(fmt.Sprintf("start of trace: flow id %s:%s -> %s:%s\n", srcIP, srcPort.String(), dstIP, dstPort.String()))
-	buffer.WriteString(route.String())
-	return buffer.String()
 }
 
 // processPacket method parses packets read from the NFQueue
@@ -201,18 +198,21 @@ func (o *NFQueueTraceObserver) processPacket(p netfilter.NFPacket) {
 	ip, _ := ipLayer.(*layers.IPv4)
 	tcp, _ := tcpLayer.(*layers.TCP)
 	tcpipflow := NewTcpIpFlowFromFlows(ip.NetworkFlow(), tcp.TransportFlow())
+	var nfqTrace *NFQueueTraceroute
 	if o.flowTracker.HasFlow(tcpipflow) == false {
-		nfqTrace := NewNFQueueTraceroute(tcpipflow, o.options.RepeatMode, o, o.options.TTLMax, o.options.TTLRepeatMax, o.options.MangleFreq, o.options.TimeoutSeconds)
+		nfqTrace = NewNFQueueTraceroute(tcpipflow, o.options.RepeatMode, o, o.options.TTLMax, o.options.TTLRepeatMax, o.options.MangleFreq, o.options.TimeoutSeconds, o.options.RouteLogger)
 		o.flowTracker.AddFlow(tcpipflow, nfqTrace)
+	} else {
+		nfqTrace = o.flowTracker.GetFlow(tcpipflow)
 	}
-	nfqTrace := o.flowTracker.GetFlow(tcpipflow)
+
 	nfqTrace.nfqPacketChan <- p
 }
 
 // startReceivingReplies createa a goroutine to read packets via a pcap sniffer
 func (o *NFQueueTraceObserver) startReceivingReplies() {
 	log.Print("startReceivingReplies\n")
-	snaplen := 65536
+	snaplen := 65536 // XXX make this a user specified option!
 	filter := "icmp or tcp"
 
 	handle, err := pcap.OpenLive(o.options.Iface, int32(snaplen), true, pcap.BlockForever)
@@ -226,10 +226,11 @@ func (o *NFQueueTraceObserver) startReceivingReplies() {
 	o.startParsingReplies()
 
 	go func() {
+	Loop:
 		for {
 			select {
 			case <-o.stopReceiveChan:
-				return
+				break Loop
 			default:
 				data, _, err := handle.ReadPacketData()
 				if err != nil {
@@ -238,6 +239,7 @@ func (o *NFQueueTraceObserver) startReceivingReplies() {
 				o.receiveParseChan <- data
 			}
 		}
+		close(o.receiveParseChan)
 	}()
 }
 
@@ -325,73 +327,12 @@ func (o *NFQueueTraceObserver) startWatchingForTcpClose() {
 			tcpBiFlowKey := NewTcpBidirectionalFlowKeyFromTcpIpFlow(tcpipflow)
 			if o.flowTracker.HasConnection(tcpBiFlowKey) {
 				if tcp.FIN {
-					log.Print("receiveTcp FIN detected\n")
 					nfqTrace := o.flowTracker.GetConnectionTrace(tcpBiFlowKey)
 					nfqTrace.Stop()
 				}
 			}
 		}
 	}()
-}
-
-// HopTick represents a single route hop at a particular instant
-type HopTick struct {
-	instant time.Time
-	ip      net.IP
-}
-
-// String returns a string representation of a HopTick
-func (t *HopTick) String() string {
-	return fmt.Sprintf("%s %s", t.ip.String(), t.instant.String())
-}
-
-// TCPResult uses a hashmap to relate route hop TTLs to TraceTick structs
-// this can be used to identify route changes over time
-type TcpRoute struct {
-	// TTL is the key
-	routeMap map[uint8][]HopTick
-}
-
-// NewTcpRoute returns a TcpRoute struct
-func NewTcpRoute() TcpRoute {
-	return TcpRoute{
-		routeMap: make(map[uint8][]HopTick, 1),
-	}
-}
-
-// AddHopTick takes a TTL and HopTick and adds them to a
-// hashmap where the TTL is the key.
-func (r *TcpRoute) AddHopTick(ttl uint8, hoptick HopTick) {
-	r.routeMap[ttl] = append(r.routeMap[ttl], hoptick)
-}
-
-// GetRepeatLength returns the number of HopTicks accumulated for a given TTL
-func (r *TcpRoute) GetRepeatLength(ttl uint8) int {
-	return len(r.routeMap[ttl])
-}
-
-// GetSortedKeys returns a slice of sorted keys (TTL) from our routeMap
-func (r *TcpRoute) GetSortedKeys() []int {
-	var keys []int
-	for k := range r.routeMap {
-		keys = append(keys, int(k))
-	}
-	sort.Ints(keys)
-	return keys
-}
-
-// String returns a string representation of the thus far accumulated traceroute information
-func (r *TcpRoute) String() string {
-	var buffer bytes.Buffer
-	hops := r.GetSortedKeys()
-	for _, k := range hops {
-		buffer.WriteString(fmt.Sprintf("ttl: %d\n", k))
-		for _, hopTick := range r.routeMap[uint8(k)] {
-			buffer.WriteString(hopTick.String())
-			buffer.WriteString("\n")
-		}
-	}
-	return buffer.String()
 }
 
 // NFQueueTraceroute struct is used to perform traceroute operations
@@ -410,7 +351,7 @@ type NFQueueTraceroute struct {
 	ttlRepeat int   // keeps track of how many duplicate TTLs we've sent
 	count     int   // counts the packets in this flow
 
-	tcpRoute TcpRoute // the tcp trace generates this TcpRoute
+	routeLogger RouteLogger // the tcp trace sends messages to the RouteLogger
 
 	stopped          bool
 	responseTimedOut bool
@@ -425,7 +366,7 @@ type NFQueueTraceroute struct {
 // NewNFQueueTraceroute returns a new NFQueueTraceroute struct and starts two goroutines;
 // a timer goroutine for determining when to increment the TTL for the traceroute operation...
 // and a goroutine to process ICMP-TTL-expired responses.
-func NewNFQueueTraceroute(id TcpIpFlow, repeatMode bool, observer *NFQueueTraceObserver, ttlMax uint8, ttlRepeatMax, mangleFreq, timeoutSeconds int) *NFQueueTraceroute {
+func NewNFQueueTraceroute(id TcpIpFlow, repeatMode bool, observer *NFQueueTraceObserver, ttlMax uint8, ttlRepeatMax, mangleFreq, timeoutSeconds int, routeLogger RouteLogger) *NFQueueTraceroute {
 	nfqTrace := NFQueueTraceroute{
 		id:                  id,
 		repeatMode:          repeatMode,
@@ -436,7 +377,7 @@ func NewNFQueueTraceroute(id TcpIpFlow, repeatMode bool, observer *NFQueueTraceO
 		ttlRepeatMax:        ttlRepeatMax,
 		mangleFreq:          mangleFreq,
 		count:               1,
-		tcpRoute:            NewTcpRoute(),
+		routeLogger:         routeLogger,
 		stopped:             false,
 		timeoutSeconds:      timeoutSeconds,
 		responseTimedOut:    false,
@@ -477,11 +418,6 @@ func (n *NFQueueTraceroute) startResponseTimer() {
 	}()
 }
 
-// submitResult... no comment because this is stupid and needs to go away and die.
-func (n *NFQueueTraceroute) submitResult() {
-	log.Print(n.observer.receiveTraceRoute(n.id, n.tcpRoute))
-}
-
 // Stop stops the timeout goroutine... but it should be further extended to
 // shutdown the entire traceroute operation which means dealing with other
 // goroutines.
@@ -493,7 +429,7 @@ func (n *NFQueueTraceroute) Stop() {
 	close(n.receiveReplyChan)
 	close(n.stopTimerChannel)
 	close(n.restartTimerChannel)
-	n.submitResult()
+	n.routeLogger.Complete()
 }
 
 // startReadingNfqPackets reads NFPackets from the channel
@@ -557,10 +493,8 @@ func (n *NFQueueTraceroute) startReceivingReplies() {
 				ip:      replyIP,
 				instant: time.Now(),
 			}
-			n.tcpRoute.AddHopTick(n.ttl, hoptick)
-			fmt.Printf("TTL %d HopTick %s\n", n.ttl, hoptick.String())
-
-			if n.ttl == n.ttlMax && (n.tcpRoute.GetRepeatLength(n.ttl) >= n.ttlRepeatMax || n.responseTimedOut) {
+			n.routeLogger.AddHopTick(n.ttl, hoptick)
+			if n.ttl == n.ttlMax && (n.routeLogger.GetRepeatLength(n.ttl) >= n.ttlRepeatMax || n.responseTimedOut) {
 				n.Stop() // finished!
 			}
 		}
