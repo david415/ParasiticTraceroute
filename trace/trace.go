@@ -494,6 +494,7 @@ func (n *NFQueueTraceroute) startReceivingReplies() {
 				instant: time.Now(),
 			}
 			n.routeLogger.AddHopTick(n.ttl, hoptick)
+
 			if n.ttl == n.ttlMax && (n.routeLogger.GetRepeatLength(n.ttl) >= n.ttlRepeatMax || n.responseTimedOut) {
 				n.Stop() // finished!
 			}

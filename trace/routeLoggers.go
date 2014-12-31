@@ -46,6 +46,7 @@ type LogfileRouteLogger struct {
 	// TTL is the key
 	routeMap map[uint8][]HopTick
 	verbose  bool
+	hopChan  chan HopTick
 }
 
 // NewLogfileRouteLogger returns a LogfileRouteLogger struct
@@ -56,6 +57,10 @@ func NewLogfileRouteLogger(verbose bool) LogfileRouteLogger {
 		verbose:  verbose,
 	}
 }
+
+//func (r *LogfileRouteLogger) SetHopChan(hopChan chan HopTick) {
+//	r.hopChan = hopChan
+//}
 
 // AddHopTick takes a TTL and HopTick and adds them to a
 // hashmap where the TTL is the key.
@@ -96,5 +101,57 @@ func (r *LogfileRouteLogger) String() string {
 }
 
 func (r *LogfileRouteLogger) Complete() {
+	log.Print(r.String())
+}
+
+type ServerRouteLogger struct {
+	// TTL is the key
+	routeMap map[uint8][]HopTick
+	HopChan  chan HopTick
+}
+
+func NewServerRouteLogger(hopChan chan HopTick) ServerRouteLogger {
+	return ServerRouteLogger{
+		routeMap: make(map[uint8][]HopTick, 1),
+		HopChan:  hopChan,
+	}
+}
+
+func (r *ServerRouteLogger) AddHopTick(ttl uint8, hoptick HopTick) {
+	log.Print("AddHopTick\n")
+	r.routeMap[ttl] = append(r.routeMap[ttl], hoptick)
+	r.HopChan <- hoptick
+}
+
+// GetRepeatLength returns the number of HopTicks accumulated for a given TTL
+func (r *ServerRouteLogger) GetRepeatLength(ttl uint8) int {
+	return len(r.routeMap[ttl])
+}
+
+// GetSortedKeys returns a slice of sorted keys (TTL) from our routeMap
+func (r *ServerRouteLogger) GetSortedKeys() []int {
+	var keys []int
+	for k := range r.routeMap {
+		keys = append(keys, int(k))
+	}
+	sort.Ints(keys)
+	return keys
+}
+
+// String returns a string representation of the thus far accumulated traceroute information
+func (r *ServerRouteLogger) String() string {
+	var buffer bytes.Buffer
+	hops := r.GetSortedKeys()
+	for _, k := range hops {
+		buffer.WriteString(fmt.Sprintf("ttl: %d\n", k))
+		for _, hopTick := range r.routeMap[uint8(k)] {
+			buffer.WriteString(hopTick.String())
+			buffer.WriteString("\n")
+		}
+	}
+	return buffer.String()
+}
+
+func (r *ServerRouteLogger) Complete() {
 	log.Print(r.String())
 }
