@@ -67,17 +67,16 @@ func NewNfqTraceServer(options NfqTraceServerOptions) NfqTraceServer {
 		options: options,
 		hopChan: make(chan trace.HopTick),
 	}
-	routeLogger := trace.NewServerRouteLogger(traceServer.hopChan)
-	traceServer.options.RouteLogger = &routeLogger
-
-	o := trace.NewNFQueueTraceObserver(traceServer.options.nfqTraceOptions)
-	o.Start()
-
 	return traceServer
 }
 
 func (n *NfqTraceServer) StartListening() {
 	log.Printf("Start\n")
+
+	routeLogger := trace.NewServerRouteLogger(n.hopChan)
+	n.options.RouteLogger = &routeLogger
+	o := trace.NewNFQueueTraceObserver(n.options.nfqTraceOptions)
+	o.Start()
 
 	tcpaddr, err := net.ResolveTCPAddr("tcp4", fmt.Sprintf("%s:%d", n.options.listenIP, n.options.listenTcpPort))
 	if err != nil {

@@ -79,10 +79,6 @@ func main() {
 	}
 
 	o := trace.NewNFQueueTraceObserver(options)
-
-	// XXX srsly? this is a terrible api... how to improve?
-	o.options.RouteLogger.SetHopChan(o.hopChan)
-
 	o.Start()
 
 	// XXX replace with code that cleans up on control-c
