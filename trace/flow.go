@@ -31,126 +31,29 @@ import (
 	"code.google.com/p/gopacket"
 	"code.google.com/p/gopacket/layers"
 	"encoding/binary"
+	"github.com/david415/HoneyBadger"
 	"sync"
 )
-
-// TcpIpFlow is used for tracking unidirectional TCP flows
-type TcpIpFlow struct {
-	ipFlow  gopacket.Flow
-	tcpFlow gopacket.Flow
-}
-
-// NewTcpIpFlowFromLayers given IPv4 and TCP layers it returns a TcpIpFlow
-func NewTcpIpFlowFromLayers(ipLayer layers.IPv4, tcpLayer layers.TCP) TcpIpFlow {
-	return TcpIpFlow{
-		ipFlow:  ipLayer.NetworkFlow(),
-		tcpFlow: tcpLayer.TransportFlow(),
-	}
-}
-
-// NewTcpIpFlowFromFlows given an IP flow and TCP flow returns a TcpIpFlow
-func NewTcpIpFlowFromFlows(ipFlow gopacket.Flow, tcpFlow gopacket.Flow) TcpIpFlow {
-	// XXX todo: check that the flow types are correct
-	return TcpIpFlow{
-		ipFlow:  ipFlow,
-		tcpFlow: tcpFlow,
-	}
-}
-
-// getPacketFlow returns a tcp/ip flowKey
-// given a byte array packet
-func NewTcpIpFlowFromPacket(packet []byte) TcpIpFlow {
-	var ip layers.IPv4
-	var tcp layers.TCP
-	decoded := []gopacket.LayerType{}
-	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeIPv4, &ip, &tcp)
-	err := parser.DecodeLayers(packet, &decoded)
-	if err != nil {
-		// XXX last 64 bits... we only use the last 32 bits
-		tcpHead := packet[len(packet)-8 : len(packet)]
-		tcpFlow := GetTCPFlowFromTCPHead(tcpHead)
-		return TcpIpFlow{
-			ipFlow:  ip.NetworkFlow(),
-			tcpFlow: tcpFlow,
-		}
-	}
-	return TcpIpFlow{
-		ipFlow:  ip.NetworkFlow(),
-		tcpFlow: tcp.TransportFlow(),
-	}
-}
-
-// Layers returns the component flow structs IPv4, TCP
-func (t *TcpIpFlow) Layers() (gopacket.Flow, gopacket.Flow) {
-	return t.ipFlow, t.tcpFlow
-}
-
-// TcpBidirectionalFlowKey struct can be used as a hashmap key.
-// Bidirectional in this case means that each of these keys
-// for each TCP connection can be represented by two TcpFlowKey`s
-type TcpBidirectionalFlowKey struct {
-	flow TcpIpFlow
-}
-
-// NewTcpBidirectionalFlowKeyFromTcpIpFlow takes a TcpIpFlow argument
-// and returns a TcpBidirectionalFlowKey
-// XXX can we please have short names for things? What should we rename it to?
-func NewTcpBidirectionalFlowKeyFromTcpIpFlow(tcpipFlow TcpIpFlow) TcpBidirectionalFlowKey {
-	var tcpSrc, tcpDst, ipSrcEnd, ipDstEnd gopacket.Endpoint
-
-	ipflow, tcpflow := tcpipFlow.Layers()
-	srcIP, dstIP := ipflow.Endpoints()
-	if srcIP.LessThan(dstIP) {
-		ipSrcEnd = srcIP
-		ipDstEnd = dstIP
-	} else {
-		ipSrcEnd = dstIP
-		ipDstEnd = srcIP
-	}
-	ipFlow, _ := gopacket.FlowFromEndpoints(ipSrcEnd, ipDstEnd)
-
-	srcPortEnd, dstPortEnd := tcpflow.Endpoints()
-	if srcPortEnd.LessThan(dstPortEnd) {
-		tcpSrc = srcPortEnd
-		tcpDst = dstPortEnd
-	} else {
-		tcpSrc = dstPortEnd
-		tcpDst = srcPortEnd
-	}
-	tcpFlow, _ := gopacket.FlowFromEndpoints(tcpSrc, tcpDst)
-
-	return TcpBidirectionalFlowKey{
-		flow: TcpIpFlow{
-			ipFlow:  ipFlow,
-			tcpFlow: tcpFlow,
-		},
-	}
-}
-
-// Get method is probably not useful. XXX
-func (f *TcpBidirectionalFlowKey) Get() TcpIpFlow {
-	return f.flow
-}
 
 // FlowTracker struct is a concurrent-safe hashmap of tcp/ip-flowKeys to NFQueueTraceroute`s
 type FlowTracker struct {
 	lock          *sync.RWMutex
-	flowMap       map[TcpIpFlow]*NFQueueTraceroute
-	connectionMap map[TcpBidirectionalFlowKey]*NFQueueTraceroute
+	flowMap       map[HoneyBadger.TcpIpFlow]*NFQueueTraceroute
+	connectionMap map[HoneyBadger.TcpBidirectionalFlow]*NFQueueTraceroute
 }
 
 // NewFlowTracker returns a new FlowTracker struct
 func NewFlowTracker() *FlowTracker {
 	return &FlowTracker{
 		lock:          new(sync.RWMutex),
-		flowMap:       make(map[TcpIpFlow]*NFQueueTraceroute),
-		connectionMap: make(map[TcpBidirectionalFlowKey]*NFQueueTraceroute),
+		flowMap:       make(map[HoneyBadger.TcpIpFlow]*NFQueueTraceroute),
+		connectionMap: make(map[HoneyBadger.TcpBidirectionalFlow]*NFQueueTraceroute),
 	}
 }
 
 // HasFlow returns true if the specified flowKey is
 // a key in our flowMap hashmap.
-func (f *FlowTracker) HasFlow(flow TcpIpFlow) bool {
+func (f *FlowTracker) HasFlow(flow HoneyBadger.TcpIpFlow) bool {
 	f.lock.RLock()
 	defer f.lock.RUnlock()
 	_, ok := f.flowMap[flow]
@@ -159,7 +62,7 @@ func (f *FlowTracker) HasFlow(flow TcpIpFlow) bool {
 
 // HasConnection returns true if the specified TcpBidirectionalFlowKey
 // is a key in our connectionMap hashmap.
-func (f *FlowTracker) HasConnection(biflow TcpBidirectionalFlowKey) bool {
+func (f *FlowTracker) HasConnection(biflow HoneyBadger.TcpBidirectionalFlow) bool {
 	f.lock.RLock()
 	defer f.lock.RUnlock()
 	_, ok := f.connectionMap[biflow]
@@ -168,34 +71,34 @@ func (f *FlowTracker) HasConnection(biflow TcpBidirectionalFlowKey) bool {
 
 // GetConnectionTrace returns the NFQueueTraceroute struct pointer associated with
 // a specified TcpBidirectionalFlowKey
-func (f *FlowTracker) GetConnectionTrace(flow TcpBidirectionalFlowKey) *NFQueueTraceroute {
+func (f *FlowTracker) GetConnectionTrace(flow HoneyBadger.TcpBidirectionalFlow) *NFQueueTraceroute {
 	return f.connectionMap[flow]
 }
 
 // AddFlow adds a NFQueueTraceroute struct pointer to our bookeeping hashmaps
 //XXX needs some cleanup?
-func (f *FlowTracker) AddFlow(flow TcpIpFlow, nfqTrace *NFQueueTraceroute) {
+func (f *FlowTracker) AddFlow(flow HoneyBadger.TcpIpFlow, nfqTrace *NFQueueTraceroute) {
 	f.lock.Lock()
 	defer f.lock.Unlock()
 	f.flowMap[flow] = nfqTrace
-	f.connectionMap[NewTcpBidirectionalFlowKeyFromTcpIpFlow(flow)] = nfqTrace
+	f.connectionMap[HoneyBadger.NewTcpBidirectionalFlowFromTcpIpFlow(flow)] = nfqTrace
 }
 
 // Delete removes the hashmap keys of the item.
 // We have two hashmaps; one for flows and one
 // for connections (bidirectional flows)...
-func (f *FlowTracker) Delete(flow TcpIpFlow) {
+func (f *FlowTracker) Delete(flow HoneyBadger.TcpIpFlow) {
 	f.lock.Lock()
 	defer f.lock.Unlock()
 	delete(f.flowMap, flow)
-	connFlow := NewTcpBidirectionalFlowKeyFromTcpIpFlow(flow)
+	connFlow := HoneyBadger.NewTcpBidirectionalFlowFromTcpIpFlow(flow)
 	delete(f.connectionMap, connFlow)
 }
 
 // GetFlowTrace returns a NFQueueTraceroute struct pointer
 // given a flowKey
 //func (f *FlowTracker) GetFlowTrace(flow TcpIpFlow) *NFQueueTraceroute {
-func (f *FlowTracker) GetFlow(flow TcpIpFlow) *NFQueueTraceroute {
+func (f *FlowTracker) GetFlow(flow HoneyBadger.TcpIpFlow) *NFQueueTraceroute {
 	f.lock.RLock()
 	defer f.lock.RUnlock()
 	ret := f.flowMap[flow]

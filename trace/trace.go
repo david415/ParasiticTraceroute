@@ -32,6 +32,7 @@ import (
 	"code.google.com/p/gopacket/layers"
 	"code.google.com/p/gopacket/pcap"
 	"fmt"
+	"github.com/david415/HoneyBadger"
 	"github.com/david415/go-netfilter-queue"
 	"log"
 	"net"
@@ -197,7 +198,7 @@ func (o *NFQueueTraceObserver) processPacket(p netfilter.NFPacket) {
 	}
 	ip, _ := ipLayer.(*layers.IPv4)
 	tcp, _ := tcpLayer.(*layers.TCP)
-	tcpipflow := NewTcpIpFlowFromFlows(ip.NetworkFlow(), tcp.TransportFlow())
+	tcpipflow := HoneyBadger.NewTcpIpFlowFromFlows(ip.NetworkFlow(), tcp.TransportFlow())
 	var nfqTrace *NFQueueTraceroute
 	if o.flowTracker.HasFlow(tcpipflow) == false {
 		nfqTrace = NewNFQueueTraceroute(tcpipflow, o.options.RepeatMode, o, o.options.TTLMax, o.options.TTLRepeatMax, o.options.MangleFreq, o.options.TimeoutSeconds, o.options.RouteLogger)
@@ -302,12 +303,20 @@ func (o *NFQueueTraceObserver) startReceivingIcmp() {
 				continue
 			}
 			// XXX todo: check that the IP header protocol value is set to TCP
-			flow := NewTcpIpFlowFromPacket(bundle.payload)
-			if o.flowTracker.HasFlow(NewTcpIpFlowFromPacket(bundle.payload)) == false {
+			tcpIpFlow, err := HoneyBadger.NewTcpIpFlowFromPacket(bundle.payload)
+			if err != nil {
+				// XXX last 64 bits... we only use the last 32 bits
+				tcpHead := bundle.payload[len(bundle.payload)-8 : len(bundle.payload)]
+				tcpFlow := GetTCPFlowFromTCPHead(tcpHead)
+				ipFlow, _ := tcpIpFlow.Flows() // XXX assume ip layer was decoded but tcp was not
+				tcpIpFlow = HoneyBadger.NewTcpIpFlowFromFlows(ipFlow, tcpFlow)
+			}
+
+			if o.flowTracker.HasFlow(tcpIpFlow) == false {
 				// ignore ICMP ttl expire packets that are for flows other than the ones we are currently tracking
 				continue
 			}
-			nfqTrace := o.flowTracker.GetFlow(flow)
+			nfqTrace := o.flowTracker.GetFlow(tcpIpFlow)
 
 			nfqTrace.receiveReplyChan <- bundle.ip.SrcIP
 			//nfqTrace.replyReceived(bundle.ip.SrcIP)
@@ -323,8 +332,8 @@ func (o *NFQueueTraceObserver) startWatchingForTcpClose() {
 	go func() {
 		for tcpIpLayer := range o.receiveTcpChan {
 			ip, tcp := tcpIpLayer.Layers()
-			tcpipflow := NewTcpIpFlowFromLayers(ip, tcp)
-			tcpBiFlowKey := NewTcpBidirectionalFlowKeyFromTcpIpFlow(tcpipflow)
+			tcpipflow := HoneyBadger.NewTcpIpFlowFromLayers(ip, tcp)
+			tcpBiFlowKey := HoneyBadger.NewTcpBidirectionalFlowFromTcpIpFlow(tcpipflow)
 			if o.flowTracker.HasConnection(tcpBiFlowKey) {
 				if tcp.FIN {
 					nfqTrace := o.flowTracker.GetConnectionTrace(tcpBiFlowKey)
@@ -338,7 +347,7 @@ func (o *NFQueueTraceObserver) startWatchingForTcpClose() {
 // NFQueueTraceroute struct is used to perform traceroute operations
 // on a single TCP flow... where flow means a unidirection packet stream.
 type NFQueueTraceroute struct {
-	id         TcpIpFlow
+	id         HoneyBadger.TcpIpFlow
 	repeatMode bool
 	observer   *NFQueueTraceObserver
 
@@ -366,7 +375,7 @@ type NFQueueTraceroute struct {
 // NewNFQueueTraceroute returns a new NFQueueTraceroute struct and starts two goroutines;
 // a timer goroutine for determining when to increment the TTL for the traceroute operation...
 // and a goroutine to process ICMP-TTL-expired responses.
-func NewNFQueueTraceroute(id TcpIpFlow, repeatMode bool, observer *NFQueueTraceObserver, ttlMax uint8, ttlRepeatMax, mangleFreq, timeoutSeconds int, routeLogger RouteLogger) *NFQueueTraceroute {
+func NewNFQueueTraceroute(id HoneyBadger.TcpIpFlow, repeatMode bool, observer *NFQueueTraceObserver, ttlMax uint8, ttlRepeatMax, mangleFreq, timeoutSeconds int, routeLogger RouteLogger) *NFQueueTraceroute {
 	nfqTrace := NFQueueTraceroute{
 		id:                  id,
 		repeatMode:          repeatMode,
