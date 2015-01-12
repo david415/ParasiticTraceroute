@@ -49,6 +49,7 @@ const (
 type HopTick struct {
 	instant time.Time
 	ip      net.IP
+	ttl     uint8
 }
 
 // String returns a string representation of a HopTick
@@ -116,6 +117,12 @@ type NFQueueTraceObserver struct {
 	// flowTracker helps use identify which traceroute operation a packet belongs to
 	flowTracker *FlowTracker
 
+	// sequence to TcpIpFlow hashmap bounded by a maximum number of keys;
+	// helps identify flows from NAT'ed TCP/IP payloads with an unknown probabalistic
+	// collision rate between NAT'ed connections :-(
+	// XXX todo: do something more clever?
+	seqTracker SequenceFlowBoundMap
+
 	// packets is a channel for interacting with NFQueue
 	packets <-chan netfilter.NFPacket
 	// done channel is used to stop all the traceroutes
@@ -148,6 +155,7 @@ func NewNFQueueTraceObserver(options NFQueueTraceObserverOptions) *NFQueueTraceO
 	}
 
 	o.flowTracker = NewFlowTracker()
+	o.seqTracker = NewSequenceFlowBoundMap(100) //XXX todo: make this a user controlled configuration parameter
 	// XXX adjust these parameters
 	o.nfq, err = netfilter.NewNFQueue(uint16(o.options.QueueId), uint32(o.options.QueueSize), netfilter.NF_DEFAULT_PACKET_SIZE)
 	if err != nil {
@@ -199,10 +207,12 @@ func (o *NFQueueTraceObserver) processPacket(p netfilter.NFPacket) {
 	ip, _ := ipLayer.(*layers.IPv4)
 	tcp, _ := tcpLayer.(*layers.TCP)
 	tcpipflow := HoneyBadger.NewTcpIpFlowFromFlows(ip.NetworkFlow(), tcp.TransportFlow())
+
 	var nfqTrace *NFQueueTraceroute
 	if o.flowTracker.HasFlow(tcpipflow) == false {
 		nfqTrace = NewNFQueueTraceroute(tcpipflow, o.options.RepeatMode, o, o.options.TTLMax, o.options.TTLRepeatMax, o.options.MangleFreq, o.options.TimeoutSeconds, o.options.RouteLogger)
 		o.flowTracker.AddFlow(tcpipflow, nfqTrace)
+		o.seqTracker.Put(tcp.Seq, tcpipflow)
 	} else {
 		nfqTrace = o.flowTracker.GetFlow(tcpipflow)
 	}
@@ -295,6 +305,11 @@ func (o *NFQueueTraceObserver) startParsingReplies() {
 // output to that traceroute's channel
 func (o *NFQueueTraceObserver) startReceivingIcmp() {
 	go func() {
+		var seq uint32
+		var nfqTrace *NFQueueTraceroute
+		var hasRFC792 bool
+		var tcpHead []byte
+
 		// bundle is network protocol layer cake payload/icmp/ip
 		for bundle := range o.receiveIcmpChan {
 			log.Print("icmp packet received\n")
@@ -304,20 +319,37 @@ func (o *NFQueueTraceObserver) startReceivingIcmp() {
 			}
 			// XXX todo: check that the IP header protocol value is set to TCP
 			tcpIpFlow, err := HoneyBadger.NewTcpIpFlowFromPacket(bundle.payload)
+
 			if err != nil {
-				// XXX last 64 bits... we only use the last 32 bits
-				tcpHead := bundle.payload[len(bundle.payload)-8 : len(bundle.payload)]
+				hasRFC792 = true
+				// XXX rfc792 means the ICMP payload contains the IP header + the last 64 bits of layer3 (e.g. TCP or UDP)
+				tcpHead = bundle.payload[len(bundle.payload)-8 : len(bundle.payload)]
 				tcpFlow := GetTCPFlowFromTCPHead(tcpHead)
 				ipFlow, _ := tcpIpFlow.Flows() // XXX assume ip layer was decoded but tcp was not
 				tcpIpFlow = HoneyBadger.NewTcpIpFlowFromFlows(ipFlow, tcpFlow)
+			} else {
+				hasRFC792 = false
 			}
 
 			if o.flowTracker.HasFlow(tcpIpFlow) == false {
-				// ignore ICMP ttl expire packets that are for flows other than the ones we are currently tracking
-				continue
+				if hasRFC792 {
+					seq = GetTCPSequenceFromTCPHead(tcpHead)
+				} else {
+					seq, err = HoneyBadger.SequenceFromPacket(bundle.payload)
+					if err != nil {
+						continue
+					}
+				}
+				if o.seqTracker.Has(seq) {
+					tcpIpFlow = o.seqTracker.Get(seq)
+					nfqTrace = o.flowTracker.GetFlow(tcpIpFlow)
+				} else {
+					// ignore ICMP ttl expire packets that are for flows other than the ones we are currently tracking
+					continue
+				}
+			} else {
+				nfqTrace = o.flowTracker.GetFlow(tcpIpFlow)
 			}
-			nfqTrace := o.flowTracker.GetFlow(tcpIpFlow)
-
 			nfqTrace.receiveReplyChan <- bundle.ip.SrcIP
 			//nfqTrace.replyReceived(bundle.ip.SrcIP)
 		}
@@ -342,6 +374,12 @@ func (o *NFQueueTraceObserver) startWatchingForTcpClose() {
 			}
 		}
 	}()
+}
+
+func (o *NFQueueTraceObserver) Subscribe(tcpIpFlow HoneyBadger.TcpIpFlow) chan trace.HopTick {
+	subscribeChan := make(chan trace.HopTick)
+
+	return subscribeChan
 }
 
 // NFQueueTraceroute struct is used to perform traceroute operations
@@ -498,11 +536,14 @@ func (n *NFQueueTraceroute) processPacket(p netfilter.NFPacket) {
 func (n *NFQueueTraceroute) startReceivingReplies() {
 	go func() {
 		for replyIP := range n.receiveReplyChan {
-			hoptick := HopTick{
+			// XXX
+			hopTick := HopTick{
 				ip:      replyIP,
 				instant: time.Now(),
 			}
-			n.routeLogger.AddHopTick(n.ttl, hoptick)
+
+			// XXX
+			n.subscribeChan <- hopTick
 
 			if n.ttl == n.ttlMax && (n.routeLogger.GetRepeatLength(n.ttl) >= n.ttlRepeatMax || n.responseTimedOut) {
 				n.Stop() // finished!

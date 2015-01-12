@@ -28,26 +28,16 @@
 package main
 
 import (
+	"code.google.com/p/gopacket"
+	"code.google.com/p/gopacket/layers"
 	"flag"
 	"fmt"
+	"github.com/david415/HoneyBadger"
 	"github.com/david415/ParasiticTraceroute/trace"
 	"log"
 	"net"
 	"time"
 )
-
-var listenIp = flag.String("listen-ip", "", "IP address of interface to listen on")
-var listenTcpPort = flag.Int("listen-port", 0, "TCP port to listen on")
-
-var repeatMode = flag.Bool("repeatMode", false, "repeatMode implies sending an additional packet instead of mangling the existing packet")
-var queueId = flag.Int("queue-id", 0, "NFQueue ID number")
-var queueSize = flag.Int("queue-size", 10000, "Maximum capacity of the NFQueue")
-var logFile = flag.String("log-file", "nfqtrace.log", "log file")
-var iface = flag.String("interface", "wlan0", "Interface to get packets from")
-var timeoutSeconds = flag.Int("timeout", 3, "Number of seconds to await a ICMP-TTL-expired response")
-var ttlMax = flag.Int("maxttl", 30, "Maximum TTL that will be used in the traceroute")
-var ttlRepeatMax = flag.Int("ttlrepeat", 2, "Number of times each TTL should be sent")
-var mangleFreq = flag.Int("packetfreq", 6, "Number of packets that should traverse a flow before we mangle the TTL")
 
 type NfqTraceServerOptions struct {
 	nfqTraceOptions trace.NFQueueTraceObserverOptions
@@ -59,13 +49,11 @@ type NfqTraceServerOptions struct {
 type NfqTraceServer struct {
 	options  NfqTraceServerOptions
 	listener net.Listener
-	hopChan  chan trace.HopTick
 }
 
 func NewNfqTraceServer(options NfqTraceServerOptions) NfqTraceServer {
 	traceServer := NfqTraceServer{
 		options: options,
-		hopChan: make(chan trace.HopTick),
 	}
 	return traceServer
 }
@@ -94,8 +82,26 @@ func (n *NfqTraceServer) StartListening() {
 			log.Printf("accept err %s\n", err)
 			continue
 		}
-		// XXX needs rate limiting and or other minimal DOS mitigation
-		go n.traceroute(conn)
+
+		log.Printf("%s -> %s\n", conn.LocalAddr().String(), conn.RemoteAddr().String())
+
+		srcTcpAddr, err := net.ResolveTCPAddr(conn.LocalAddr().Network(), conn.LocalAddr().String())
+		if err != nil {
+			panic(err)
+		}
+
+		dstTcpAddr, err := net.ResolveTCPAddr(conn.RemoteAddr().Network(), conn.RemoteAddr().String())
+		if err != nil {
+			panic(err)
+		}
+
+		ipFlow, _ := gopacket.FlowFromEndpoints(layers.NewIPEndpoint(srcTcpAddr.IP), layers.NewIPEndpoint(dstTcpAddr.IP))
+		tcpFlow, _ := gopacket.FlowFromEndpoints(layers.NewTCPPortEndpoint(layers.TCPPort(srcTcpAddr.Port)), layers.NewTCPPortEndpoint(layers.TCPPort(dstTcpAddr.Port)))
+		tcpIpFlow := HoneyBadger.NewTcpIpFlowFromFlows(ipFlow, tcpFlow)
+		subscribChan := o.Subscribe(tcpIpFlow)
+
+		// XXX needs rate limiting and or other minimal DOS mitigation?
+		go n.traceroute(conn, subscribeChan)
 	}
 	return
 }
@@ -112,10 +118,7 @@ func (n *NfqTraceServer) sendPeriodicNoise(stop chan bool, out chan []byte) {
 	}
 }
 
-func (n *NfqTraceServer) traceroute(conn net.Conn) {
-
-	log.Printf("traceroute local tcp listen addr %s\n", conn.LocalAddr().String())
-	log.Printf("traceroute local tcp listen addr %s\n", conn.RemoteAddr().String())
+func (n *NfqTraceServer) traceroute(conn net.Conn, subscribeChan chan trace.HopTick) {
 
 	noiseChan := make(chan []byte)
 	stopTrace := make(chan bool)
@@ -128,7 +131,7 @@ func (n *NfqTraceServer) traceroute(conn net.Conn) {
 				return
 			case noise := <-noiseChan:
 				conn.Write(noise)
-			case hop := <-n.hopChan:
+			case hop := <-subscribeChan:
 				conn.Write([]byte(hop.String()))
 			}
 		}
@@ -137,6 +140,19 @@ func (n *NfqTraceServer) traceroute(conn net.Conn) {
 }
 
 func main() {
+
+	var (
+		listenIp       = flag.String("listen-ip", "", "IP address of interface to listen on")
+		listenTcpPort  = flag.Int("listen-port", 0, "TCP port to listen on")
+		repeatMode     = flag.Bool("repeatMode", false, "repeatMode implies sending an additional packet instead of mangling the existing packet")
+		queueId        = flag.Int("queue-id", 0, "NFQueue ID number")
+		queueSize      = flag.Int("queue-size", 10000, "Maximum capacity of the NFQueue")
+		iface          = flag.String("interface", "wlan0", "Interface to get packets from")
+		timeoutSeconds = flag.Int("timeout", 3, "Number of seconds to await a ICMP-TTL-expired response")
+		ttlMax         = flag.Int("maxttl", 30, "Maximum TTL that will be used in the traceroute")
+		ttlRepeatMax   = flag.Int("ttlrepeat", 2, "Number of times each TTL should be sent")
+		mangleFreq     = flag.Int("packetfreq", 6, "Number of packets that should traverse a flow before we mangle the TTL")
+	)
 
 	flag.Parse()
 

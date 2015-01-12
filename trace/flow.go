@@ -126,6 +126,10 @@ func GetTCPFlowFromTCPHead(data []byte) gopacket.Flow {
 	return tcpFlow
 }
 
+func GetTCPSequenceFromTCPHead(data []byte) uint32 {
+	return binary.BigEndian.Uint32(data[4:8])
+}
+
 // SerializeWithTTL takes a gopacket.Packet (containing a TCP/IP layers) and a TTL
 // and returns a byte array of the serialized packet with the specified TTL
 func SerializeWithTTL(p gopacket.Packet, ttl uint8) []byte {

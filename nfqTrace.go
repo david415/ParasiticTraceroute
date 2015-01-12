@@ -37,17 +37,6 @@ const (
 	MAX_TTL uint8 = 255
 )
 
-var verboseLog = flag.Bool("verboseLog", true, "Output route hops to log before traceroute is complete?")
-var repeatMode = flag.Bool("repeatMode", false, "repeatMode implies sending an additional packet instead of mangling the existing packet")
-var queueId = flag.Int("queue-id", 0, "NFQueue ID number")
-var queueSize = flag.Int("queue-size", 10000, "Maximum capacity of the NFQueue")
-var logFile = flag.String("log-file", "nfqtrace.log", "log file")
-var iface = flag.String("interface", "wlan0", "Interface to get packets from")
-var timeoutSeconds = flag.Int("timeout", 1, "Number of seconds to await a ICMP-TTL-expired response")
-var ttlMax = flag.Int("maxttl", 30, "Maximum TTL that will be used in the traceroute")
-var ttlRepeatMax = flag.Int("ttlrepeat", 2, "Number of times each TTL should be sent")
-var mangleFreq = flag.Int("packetfreq", 6, "Number of packets that should traverse a flow before we mangle the TTL")
-
 /***
 to be used with an iptables nfqueue rule that will select
 a tcp flow like this:
@@ -57,6 +46,19 @@ or like this:
 iptables -A OUTPUT -j NFQUEUE --queue-num 0 -p tcp --sport 9000
 ***/
 func main() {
+
+	var (
+		verboseLog     = flag.Bool("verboseLog", true, "Output route hops to log before traceroute is complete?")
+		repeatMode     = flag.Bool("repeatMode", false, "repeatMode implies sending an additional packet instead of mangling the existing packet")
+		queueId        = flag.Int("queue-id", 0, "NFQueue ID number")
+		queueSize      = flag.Int("queue-size", 10000, "Maximum capacity of the NFQueue")
+		logFile        = flag.String("log-file", "nfqtrace.log", "log file")
+		iface          = flag.String("interface", "wlan0", "Interface to get packets from")
+		timeoutSeconds = flag.Int("timeout", 1, "Number of seconds to await a ICMP-TTL-expired response")
+		ttlMax         = flag.Int("maxttl", 30, "Maximum TTL that will be used in the traceroute")
+		ttlRepeatMax   = flag.Int("ttlrepeat", 2, "Number of times each TTL should be sent")
+		mangleFreq     = flag.Int("packetfreq", 6, "Number of packets that should traverse a flow before we mangle the TTL")
+	)
 
 	flag.Parse()
 	f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
