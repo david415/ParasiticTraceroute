@@ -7,11 +7,11 @@ nfqtrace library and commandline tool
 abstract
 --------
 The nfqTrace program performs TCP traceroutes on outgoing streams
-wheather they be from a TCP client or server. The Linux Netfilter
+whether they be from a TCP client or server. The Linux Netfilter
 Queue facility is used to man-in-the-middle TCP packets. Among the
 packets that nfqtrace receives from the nfqueue we identify all the
 flows and keep track of them. We periodically alter a packet from the
-stream and set it's TTL differently such that it may result in a ICMP
+stream and set its TTL differently such that it may result in a ICMP
 TTL-expired response from a distant router.
 
 what is NFQueue?
