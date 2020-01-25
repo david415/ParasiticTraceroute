@@ -28,9 +28,9 @@
 package trace
 
 import (
-	"code.google.com/p/gopacket"
-	"code.google.com/p/gopacket/layers"
 	"encoding/binary"
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 	"sync"
 )
 

@@ -28,15 +28,16 @@
 package trace
 
 import (
-	"code.google.com/p/gopacket"
-	"code.google.com/p/gopacket/layers"
-	"code.google.com/p/gopacket/pcap"
 	"fmt"
-	"github.com/david415/go-netfilter-queue"
 	"log"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcap"
+	"github.com/subgraph/go-nfnetlink/nfqueue"
 )
 
 const (
@@ -109,14 +110,16 @@ type NFQueueTraceObserverOptions struct {
 type NFQueueTraceObserver struct {
 	// options is passed in from the user in our constructor NewNFQueueTraceObserver
 	options NFQueueTraceObserverOptions
-	// nfq is used to talk to the Netfilter Queue
-	nfq *netfilter.NFQueue
+
+	// nfq is used to talk to the Netfilter Queue for capturing and mangling packets
+	// so we can mess with the TTL and perform a traceroute.
+	nfq *nfqueue.NFQueue
 
 	// flowTracker helps use identify which traceroute operation a packet belongs to
 	flowTracker *FlowTracker
 
 	// packets is a channel for interacting with NFQueue
-	packets <-chan netfilter.NFPacket
+	packets <-chan *nfqueue.NFQPacket
 	// done channel is used to stop all the traceroutes
 	done chan bool
 
@@ -147,12 +150,11 @@ func NewNFQueueTraceObserver(options NFQueueTraceObserverOptions) *NFQueueTraceO
 	}
 
 	o.flowTracker = NewFlowTracker()
-	// XXX adjust these parameters
-	o.nfq, err = netfilter.NewNFQueue(uint16(o.options.QueueId), uint32(o.options.QueueSize), netfilter.NF_DEFAULT_PACKET_SIZE)
+	o.nfq = nfqueue.NewNFQueue(uint16(o.options.QueueId))
+	o.packets, err = o.nfq.Open()
 	if err != nil {
 		panic(err)
 	}
-	o.packets = o.nfq.GetPackets()
 	return &o
 }
 
@@ -170,8 +172,6 @@ func (o *NFQueueTraceObserver) Start() {
 				o.processPacket(p)
 			case <-o.done:
 				o.nfq.Close()
-				close(o.done) // XXX necessary?
-				// XXX todo: stop other goroutines
 				break
 			}
 		}
@@ -188,7 +188,7 @@ func (o *NFQueueTraceObserver) Stop() {
 
 // processPacket method parses packets read from the NFQueue
 // and dispatches them to the appropriate traceroute pipeline
-func (o *NFQueueTraceObserver) processPacket(p netfilter.NFPacket) {
+func (o *NFQueueTraceObserver) processPacket(p *nfqueue.NFQPacket) {
 	ipLayer := p.Packet.Layer(layers.LayerTypeIPv4)
 	tcpLayer := p.Packet.Layer(layers.LayerTypeTCP)
 	if ipLayer == nil || tcpLayer == nil {
@@ -206,7 +206,7 @@ func (o *NFQueueTraceObserver) processPacket(p netfilter.NFPacket) {
 		nfqTrace = o.flowTracker.GetFlow(tcpipflow)
 	}
 
-	nfqTrace.nfqPacketChan <- p
+	nfqTrace.nfqPacketChan <- *p
 }
 
 // startReceivingReplies createa a goroutine to read packets via a pcap sniffer
@@ -356,7 +356,7 @@ type NFQueueTraceroute struct {
 	stopped          bool
 	responseTimedOut bool
 
-	nfqPacketChan    chan netfilter.NFPacket
+	nfqPacketChan    chan nfqueue.NFQPacket
 	receiveReplyChan chan net.IP
 
 	stopTimerChannel    chan bool
@@ -381,7 +381,7 @@ func NewNFQueueTraceroute(id TcpIpFlow, repeatMode bool, observer *NFQueueTraceO
 		stopped:             false,
 		timeoutSeconds:      timeoutSeconds,
 		responseTimedOut:    false,
-		nfqPacketChan:       make(chan netfilter.NFPacket),
+		nfqPacketChan:       make(chan nfqueue.NFQPacket),
 		receiveReplyChan:    make(chan net.IP),
 		stopTimerChannel:    make(chan bool),
 		restartTimerChannel: make(chan bool),
@@ -432,7 +432,7 @@ func (n *NFQueueTraceroute) Stop() {
 	n.routeLogger.Complete()
 }
 
-// startReadingNfqPackets reads NFPackets from the channel
+// startReadingNfqPackets reads NFQPackets from the channel
 // and calls processPacket to do something with the packet
 func (n *NFQueueTraceroute) startReadingNfqPackets() {
 	go func() {
@@ -444,17 +444,23 @@ func (n *NFQueueTraceroute) startReadingNfqPackets() {
 
 // processPacket receives packets from the NFQueue and decides weather
 // or not to mangle the TTL for our tracerouting purposes.
-func (n *NFQueueTraceroute) processPacket(p netfilter.NFPacket) {
+func (n *NFQueueTraceroute) processPacket(p nfqueue.NFQPacket) {
 
 	if n.stopped {
-		p.SetVerdict(netfilter.NF_ACCEPT)
+		err := p.Accept()
+		if err != nil {
+			panic(err)
+		}
 		return
 	}
 
 	if n.ttl > n.ttlMax {
 		if n.responseTimedOut {
 			n.Stop()
-			p.SetVerdict(netfilter.NF_ACCEPT)
+			err := p.Accept()
+			if err != nil {
+				panic(err)
+			}
 			return
 		}
 	}
@@ -470,16 +476,16 @@ func (n *NFQueueTraceroute) processPacket(p netfilter.NFPacket) {
 		}
 		if n.ttlRepeat < n.ttlRepeatMax {
 			if n.repeatMode {
-				p.SetModifiedVerdict(netfilter.NF_REPEAT, SerializeWithTTL(p.Packet, n.ttl))
+				p.SetModifiedVerdict(nfqueue.NF_REPEAT, SerializeWithTTL(p.Packet, n.ttl))
 			} else {
-				p.SetModifiedVerdict(netfilter.NF_ACCEPT, SerializeWithTTL(p.Packet, n.ttl))
+				p.SetModifiedVerdict(nfqueue.NF_ACCEPT, SerializeWithTTL(p.Packet, n.ttl))
 			}
 			n.ttlRepeat += 1
 		} else {
-			p.SetVerdict(netfilter.NF_ACCEPT)
+			p.SetVerdict(nfqueue.NF_ACCEPT)
 		}
 	} else {
-		p.SetVerdict(netfilter.NF_ACCEPT)
+		p.SetVerdict(nfqueue.NF_ACCEPT)
 	}
 	n.count = n.count + 1
 }
