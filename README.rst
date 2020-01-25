@@ -34,21 +34,12 @@ status
 ------
 Alpha version is working and ready for non-production use.
 
-software dependencies
----------------------
-1. Linux kernel 2.6.14 or later
-2. libnetfilter-queue_0.0.17 or later
-3. https://github.com/david415/go-netfilter-queue
-
 installation procedure
 ----------------------
 for debian based systems this or something similar should work
 
 1. sudo apt-get install libnetfilter-queue-dev libpcap-dev
 2. go get github.com/david415/ParasiticTraceroute
-
-
-note: you must have your golang build environment setup properly to build **go-netfilter-queue**
 
 
 usage
@@ -92,15 +83,11 @@ future features
 5. repeatedly perform the trace on connections that stay open; This feature addition implies contiuously appending to a trace result list for a given connction...
 
 
-
 ================
 acknowledgements
 ================
 
-* This development effort is a direct result from design discussions with Leif Ryge and Aaron Gibson, advisors/consultants for the Tor Project.
-
-* Krishna Raman <kraman@gmail.com> has written most of the code the `go-netfilter-queue` library that I use. I recently added the packet injection capability to the library which can be found here: https://github.com/david415/go-netfilter-queue Merge to upstream pending 3rd party code review. Any takers?
-
+* This development effort is a direct result from design discussions with Leif Ryge and Aaron Gibson.
 
 =======
 contact
@@ -117,7 +104,6 @@ contact info
 ------------
 
 * email dstainton415@gmail.com
-* gpg key ID 0x836501BE9F27A723
 * gpg fingerprint F473 51BD 87AB 7FCF 6F88  80C9 8365 01BE 9F27 A723
 
-It may also be possible to contact me as ``dawuud`` in #tor-dev and #ooni on `OFTC <http://www.oftc.net/oftc/>`_
+It may also be possible to contact me as ``dawuud`` in #katzenpost on `OFTC <http://www.oftc.net/oftc/>`_
