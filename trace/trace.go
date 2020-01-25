@@ -28,15 +28,16 @@
 package trace
 
 import (
-	"code.google.com/p/gopacket"
-	"code.google.com/p/gopacket/layers"
-	"code.google.com/p/gopacket/pcap"
 	"fmt"
-	"github.com/david415/go-netfilter-queue"
 	"log"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/AkihiroSuda/go-netfilter-queue"
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcap"
 )
 
 const (
@@ -470,9 +471,9 @@ func (n *NFQueueTraceroute) processPacket(p netfilter.NFPacket) {
 		}
 		if n.ttlRepeat < n.ttlRepeatMax {
 			if n.repeatMode {
-				p.SetModifiedVerdict(netfilter.NF_REPEAT, SerializeWithTTL(p.Packet, n.ttl))
+				p.SetVerdictWithPacket(netfilter.NF_REPEAT, SerializeWithTTL(p.Packet, n.ttl))
 			} else {
-				p.SetModifiedVerdict(netfilter.NF_ACCEPT, SerializeWithTTL(p.Packet, n.ttl))
+				p.SetVerdictWithPacket(netfilter.NF_ACCEPT, SerializeWithTTL(p.Packet, n.ttl))
 			}
 			n.ttlRepeat += 1
 		} else {

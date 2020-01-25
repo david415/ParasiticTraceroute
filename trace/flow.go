@@ -28,10 +28,11 @@
 package trace
 
 import (
-	"code.google.com/p/gopacket"
-	"code.google.com/p/gopacket/layers"
 	"encoding/binary"
 	"sync"
+
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 )
 
 // TcpIpFlow is used for tracking unidirectional TCP flows
